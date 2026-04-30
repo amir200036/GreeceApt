@@ -1,865 +1,858 @@
-# scrape_xe.py
-#
-# XE.gr apartment listings scraper (Athens-focused).
-# - Collects listing URLs from search results pages (scroll + pagination)
-# - Opens each listing page and extracts details
-# - Writes to data/listings.json (deduped by normalized listing URL)
-#
-# Output fields (per listing):
-#   url, source, scraped_at, Headline, price_eur, price_per_sqm, area_sqm,
-#   neighborhood, area, address_raw,
-#   bedrooms, bathrooms, floor, year_built, renovation_year, energy_class,
-#   photos_count, photo_urls, publication_date
-#
-# Rules:
-# - We do NOT store "city"/"municipality" as a separate field (Athens-only project).
-# - neighborhood = single canonical scoring field
-# - area = ONLY the geographic prefix if present in neighborhood (Ano/Kato/Nea/Neo); else None
-# - IMPORTANT: "Agia/Agios/Agioi" are NOT treated as prefixes (they remain part of the name)
-#
-# Examples:
-#   "Ano Kypseli"    -> neighborhood="Kypseli",  area="Ano"
-#   "Kato Patisia"   -> neighborhood="Patisia",  area="Kato"
-#   "Agia Eleousa"   -> neighborhood="Agia Eleousa", area=None
-#   "Zografou Ilisia"-> neighborhood="Zografou", area=None   (cleaned municipality)
-#   "Kallithea Agia Eleousa" -> neighborhood="Kallithea", area=None (cleaned municipality)
-
 import asyncio
 import json
+import logging
+import os
+import random
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, BrowserContext, Page, TimeoutError
+from curl_cffi import requests
+from playwright.async_api import async_playwright
 
-from greeceapt.cookies.cookie_manager import ensure_cookies
-from greeceapt.utils import url_builder
-from greeceapt.utils.helpers import (
-    normalize_listing_url,
-    AREA_PREFIXES,
-    extract_area_prefix,
-    strip_area_prefix,
-)
-
-# -----------------------------
-# Paths / constants
-# -----------------------------
+from greeceapt.cookies.cookie_manager import load_cookies
+from greeceapt.utils.helpers import normalize_listing_url, resolve_neighborhood
+from greeceapt.utils.url_builder import ATHENS_CENTER_ID, BASE_URL_XE, build_xe_url
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-
 DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-STATE_PATH = DATA_DIR / "state.json"
+LISTINGS_JSON = DATA_DIR / "scraper_listings.json"
 COOKIES_PATH = DATA_DIR / "cookies.json"
 
-BASE_URL = "https://www.xe.gr"
+MAP_SEARCH_URL = "https://www.xe.gr/en/property/results/map_search"
+SINGLE_RESULT_URL = "https://www.xe.gr/en/property/results/single_result"
+AD_GROUP_URL = "https://www.xe.gr/en/property/unique_properties"
+RESULTS_REFERER = BASE_URL_XE
 
-# Playwright navigation timeout for listing pages (milliseconds)
-NAVIGATION_TIMEOUT_MS = 60_000
+BATCH_COMMIT_SIZE = int(os.getenv("BATCH_COMMIT_SIZE", "25"))
+DETAIL_MAX_RETRIES = int(os.getenv("DETAIL_MAX_RETRIES", "3"))
+DETAIL_RETRY_BASE_DELAY = float(os.getenv("DETAIL_RETRY_BASE_DELAY", "1.5"))
+DISCOVERY_MAX_RETRIES = int(os.getenv("DISCOVERY_MAX_RETRIES", "3"))
 
-# Max concurrent listing-detail page loads
-DETAIL_CONCURRENCY = 5
+DEFAULT_MIN_PRICE = 30_000
+DEFAULT_MAX_PRICE = 70_000
+DEFAULT_MAX_PAGES = 50
+DISCOVERY_ITEM_KEYS = ("items", "result_items", "results", "ads")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
-# -----------------------------
-# State (pagination)
-# -----------------------------
+def _first_present(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] not in (None, ""):
+            return mapping[key]
+    return None
 
-def load_last_page() -> int:
-    """Read last scanned page number from data/state.json. Returns 0 if missing/invalid."""
-    if not STATE_PATH.exists():
-        return 0
+
+def _deep_first(node: Any, keys: tuple[str, ...]) -> Any:
+    if isinstance(node, dict):
+        for key in keys:
+            if key in node and node[key] not in (None, ""):
+                return node[key]
+        for value in node.values():
+            found = _deep_first(value, keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _deep_first(item, keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def clean_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if not digits:
+        return None
     try:
-        with STATE_PATH.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return int(data.get("last_page", 0)) or 0
-    except Exception:
-        return 0
+        return int(digits)
+    except ValueError:
+        return None
 
 
-def save_last_page(page_num: int) -> None:
-    """Persist last scanned page number to data/state.json."""
-    with STATE_PATH.open("w", encoding="utf-8") as f:
-        json.dump({"last_page": int(page_num)}, f, ensure_ascii=False, indent=2)
-    print(f"[STATE] Saved last_page={page_num} -> {STATE_PATH}")
+_FLOOR_TEXT_MAP: dict[str, float] = {
+    "basement":               -1.0,
+    "lower ground":           -1.0,
+    "semi-basement":          -0.5,
+    "semi basement":          -0.5,
+    "ground floor":            0.0,
+    "ground":                  0.0,
+    "elevated ground floor":   0.5,
+    "elevated ground":         0.5,
+    "raised ground floor":     0.5,
+    "mezzanine":               0.5,
+}
+_ORDINAL_RE = re.compile(r"(\d+)\s*(?:st|nd|rd|th)\b", re.IGNORECASE)
 
 
-# -----------------------------
-# Bot verification (manual)
-# -----------------------------
-
-# Text snippets that indicate XE's "confirm you are human" / captcha page
-VERIFICATION_MARKERS = [
-    "Let's confirm you are human",
-    "Complete the security check",
-    "No robots allowed",
-    "Βεβαιώσου πως είσαι μέρος της ανθρωπότητας",  # Greek: "Make sure you're part of humanity"
-]
-
-
-async def is_verification_page(page: Page) -> bool:
-    """Check if the current page shows XE's human verification / captcha.
-    Uses DOM text locators instead of fetching the full HTML."""
-    try:
-        for marker in VERIFICATION_MARKERS:
-            if await page.get_by_text(marker, exact=False).count() > 0:
-                return True
-        return False
-    except Exception:
-        return False
-
-
-async def wait_for_user_to_solve_verification(
-    page: Page,
-    success_selector: str = 'a[data-testid="property-ad-url"]',
-    timeout_ms: int = 120_000,
-) -> None:
-    """
-    Pause and wait for the user to solve the captcha in the browser.
-    Uses asyncio.to_thread for input() so the event loop stays responsive.
-    After user presses Enter, waits for success_selector to appear.
-    """
-    print("\n" + "=" * 60)
-    print("[VERIFY] XE is showing a security check (captcha / human verification).")
-    print("[VERIFY] Complete the check in the BROWSER window.")
-    print("[VERIFY] Do NOT press Enter until you have finished solving it.")
-    print("[VERIFY] When the page is ready again, press Enter here.")
-    print("=" * 60)
-    await asyncio.to_thread(input, "\n[VERIFY] Press Enter when done: ")
-
-    try:
-        await page.wait_for_selector(success_selector, timeout=timeout_ms)
-        print("[VERIFY] Page ready, continuing.\n")
-    except TimeoutError:
-        print("[WARN] Success selector not found after timeout; continuing anyway.\n")
-
-
-async def ensure_no_verification_blocking(page: Page) -> None:
-    """
-    If XE is showing a verification/captcha page, pause until the user solves it.
-    Call this before each page operation (scroll, extract) so we never proceed
-    while blocked by a captcha.
-    """
-    if await is_verification_page(page):
-        await wait_for_user_to_solve_verification(page)
-
-
-# -----------------------------
-# URL helpers / dedupe
-# -----------------------------
-
-def normalize_property_url(href: str) -> str:
-    """Normalize a listing href to a stable key (no query/fragment)."""
-    return normalize_listing_url(urljoin(BASE_URL, href))
-
-def dedupe_listing_urls(urls: list[str]) -> list[str]:
-    """Deduplicate listing URLs by normalized path."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for u in urls:
-        key = normalize_listing_url(u)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(u)
-    print(f"[DEDUPE] {len(urls)} raw URLs -> {len(out)} unique listing URLs")
-    return out
-
-
-# -----------------------------
-# Parsing helpers
-# -----------------------------
-
-def parse_number(text: str) -> int | None:
-    """Parse int from strings like '59.000 €' or '€59,000'."""
+def clean_floor(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
     if not text:
         return None
-    cleaned = re.sub(r"[^\d,\.]", "", text)
-    cleaned = cleaned.replace(".", "").replace(",", "")
-    return int(cleaned) if cleaned.isdigit() else None
-
-
-def parse_first_int(text: str) -> int | None:
-    """Extract the first integer token from free-form text (e.g. 'WC: 1 + 1')."""
-    if not text:
-        return None
-    m = re.search(r"\d+", text)
-    return int(m.group()) if m else None
-
-
-def parse_area_from_title(title: str) -> int | None:
-    """Extract area (sq.m.) from a title like 'Apartment 47 sq.m.'."""
-    if not title:
-        return None
-    m = re.search(r"(\d+)\s*sq\.m\.?", title, re.IGNORECASE)
-    return int(m.group(1)) if m else None
-
-
-def parse_floor(text: str) -> int | str | None:
-    """Normalize floor: basement=-1, ground=0, otherwise integer if present."""
-    if not text:
-        return None
-
-    parts = text.split(":", 1)
-    val = parts[1].strip() if len(parts) > 1 else text.strip()
-    v = val.lower()
-
-    if "semi-basement" in v or "basement" in v:
-        return -1
-    if "elevated ground floor" in v or "ground floor" in v or "mezzanine" in v:
-        return 0
-
-    m = re.search(r"\d+", v)
+    # Plain integer string ("3") or negative ("-1")
+    try:
+        return float(int(text))
+    except ValueError:
+        pass
+    # Ordinal: "1st", "2nd floor", "3rd", "4th floor"
+    m = _ORDINAL_RE.search(text)
     if m:
-        return int(m.group())
-    return val
+        return float(int(m.group(1)))
+    # Text keyword match (longest key first to avoid "ground" shadowing "ground floor")
+    lower = text.lower()
+    for key in sorted(_FLOOR_TEXT_MAP, key=len, reverse=True):
+        if key in lower:
+            return _FLOOR_TEXT_MAP[key]
+    return None
 
 
-def normalize_energy_class(raw: str | None) -> str | None:
-    """
-    Normalize energy class to:
-      A+, A, A-, B+, B, C, D, E, F, G, Unknown
-
-    Handles Greek letters often used in Greece EPC labels:
-      Α, Β, Γ, Δ, Ε, Ζ, Η => A, B, C, D, E, F, G
-    """
-    if not raw:
+def clean_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
         return None
+    if isinstance(value, (int, float)):
+        return float(value)
 
-    s = raw.strip()
-    if not s:
+    token_match = re.search(r"\d[\d.,]*", str(value).strip())
+    if not token_match:
         return None
+    token = token_match.group(0)
 
-    # If passed a full label like "Energy Class: Η"
-    if ":" in s:
-        s = s.split(":", 1)[1].strip()
-
-    s = s.replace("–", "-").replace("—", "-").strip()
-    s_upper = s.upper().replace(" ", "")
-
-    allowed = {"A+", "A", "A-", "B+", "B", "C", "D", "E", "F", "G", "UNKNOWN"}
-    if s_upper in allowed:
-        return "Unknown" if s_upper == "UNKNOWN" else s_upper
-
-    greek_map = {
-        "Α+": "A+",
-        "Α": "A",
-        "Β+": "B+",
-        "Β": "B",
-        "Γ": "C",
-        "Δ": "D",
-        "Ε": "E",
-        "Ζ": "F",
-        "Η": "G",
-    }
-
-    if s_upper in greek_map:
-        return greek_map[s_upper]
-
-    # Fallback: first character mapping if it's Greek
-    if s and s[0] in greek_map:
-        return greek_map[s[0]]
-
-    return s  # keep as-is if unknown format
-
-
-# -----------------------------
-# Location parsing -> neighborhood + prefix-only area
-# -----------------------------
-
-def parse_location_from_address_element(addr_el) -> tuple[str | None, str | None, str | None]:
-    """
-    Returns:
-      municipality, area_raw, address_raw
-
-    XE often has separate <a> links (municipality + area).
-    If not, fallback to text parsing.
-    """
-    if not addr_el:
-        return None, None, None
-
-    address_raw = addr_el.get_text(" ", strip=True)
-
-    links = [a.get_text(" ", strip=True) for a in addr_el.select("a") if a.get_text(strip=True)]
-    if len(links) >= 2:
-        return links[0], links[1], address_raw
-    if len(links) == 1:
-        return links[0], None, address_raw
-
-    txt = address_raw
-
-    # City (Area)
-    if "(" in txt and txt.endswith(")"):
-        city, rest = txt.split("(", 1)
-        return city.strip() or None, rest[:-1].strip() or None, address_raw
-
-    # City - Area
-    if " - " in txt:
-        p0, p1 = [p.strip() for p in txt.split(" - ", 1)]
-        return p0 or None, p1 or None, address_raw
-
-    # City, Area
-    if "," in txt:
-        p0, p1 = [p.strip() for p in txt.split(",", 1)]
-        return p0 or None, p1 or None, address_raw
-
-    return txt.strip() or None, None, address_raw
-
-
-def normalize_municipality_and_area(
-    municipality: str | None,
-    area_raw: str | None
-) -> tuple[str | None, str | None]:
-    """
-    Fix cases like:
-      "Zografou Ilisia"            -> municipality="Zografou", area_raw="Ilisia"
-      "Kallithea Agia Eleousa"     -> municipality="Kallithea", area_raw="Agia Eleousa"
-
-    IMPORTANT: Do NOT break real municipalities like "Nea Smyrni".
-    Heuristic:
-    - If municipality has >=2 tokens
-    - AND area_raw is missing
-    - AND the first token is NOT one of {Ano,Kato,Nea,Neo}
-      => split municipality into (first token) + (rest as area_raw)
-    """
-    mun = (municipality or "").strip() or None
-    ar = (area_raw or "").strip() or None
-
-    if mun and (ar is None):
-        parts = mun.split()
-        if len(parts) >= 2 and parts[0].lower() not in AREA_PREFIXES:
-            mun = parts[0].strip() or None
-            rest = " ".join(parts[1:]).strip()
-            ar = rest or None
-
-    return mun, ar
-
-
-def resolve_neighborhood_and_prefix(
-    municipality: str | None,
-    area_raw: str | None
-) -> tuple[str | None, str | None]:
-    """
-    Single canonical scoring field + prefix-only category.
-
-    Step 1) Normalize weird municipality strings (e.g. "Zografou Ilisia").
-    Step 2) Choose a single name candidate:
-       - If municipality exists and is NOT "Athens" -> candidate = municipality
-       - Else (Athens)                             -> candidate = area_raw (or municipality if area_raw missing)
-    Step 3) area = prefix (Ano/Kato/Nea/Neo) extracted from candidate
-            neighborhood = candidate with that prefix stripped
-    """
-    mun, ar = normalize_municipality_and_area(municipality, area_raw)
-
-    if not mun and not ar:
-        return None, None
-
-    if mun and mun.lower() != "athens":
-        candidate = mun
-    else:
-        candidate = ar or mun
-
-    prefix = extract_area_prefix(candidate)
-    neighborhood = strip_area_prefix(candidate)
-
-    return neighborhood, prefix
-
-
-# -----------------------------
-# Search result extraction (per page)
-# -----------------------------
-
-async def load_all_search_results(page: Page, max_rounds: int = 20) -> None:
-    """
-    Scroll to load more ads.
-    Stops only after repeated no-growth rounds to avoid premature early exit.
-    """
-    last_count = -1
-    no_growth_rounds = 0
-    for _ in range(max_rounds):
-        count = await page.locator('a[data-testid="property-ad-url"]').count()
-        if count == last_count:
-            no_growth_rounds += 1
+    if "." in token and "," in token:
+        if token.rfind(",") > token.rfind("."):
+            token = token.replace(".", "").replace(",", ".")
         else:
-            no_growth_rounds = 0
-        # Require multiple stagnant rounds before stopping.
-        if no_growth_rounds >= 2:
-            return
-        last_count = count
-        await page.mouse.wheel(0, 1200)
-        await page.wait_for_timeout(600)
+            token = token.replace(",", "")
+    elif "," in token:
+        parts = token.split(",")
+        token = "".join(parts) if len(parts[-1]) == 3 else token.replace(",", ".")
+    elif "." in token:
+        parts = token.split(".")
+        if len(parts[-1]) == 3 and len(parts) > 1:
+            token = "".join(parts)
 
-
-async def resolve_group_best_price_variant(ctx: BrowserContext, group_url: str) -> str | None:
-    """
-    For '/u/' (multiple listings) pages:
-    choose the variant with the lowest visible price.
-    """
-    group_page = await ctx.new_page()
     try:
-        await group_page.goto(group_url, wait_until="domcontentloaded")
+        return float(token)
+    except ValueError:
+        return None
+
+
+def clean_price_eur(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return float(int(digits))
+    except ValueError:
+        return None
+
+
+def normalize_publication_date(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        return text[:10]
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
         try:
-            await group_page.wait_for_selector(
-                '[data-testid="unique-property-ad-container"]', timeout=6000
-            )
-        except TimeoutError:
-            pass
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return text
 
-        soup = BeautifulSoup(await group_page.content(), "html.parser")
 
-        best_url: str | None = None
-        best_price: int | None = None
+def flatten_characteristics(node: dict[str, Any]) -> dict[str, Any]:
+    flattened: dict[str, Any] = {}
+    characteristics = node.get("characteristics_list")
+    if not isinstance(characteristics, list):
+        return flattened
+    for entry in characteristics:
+        if not isinstance(entry, dict):
+            continue
+        label_raw = _first_present(entry, "text", "label", "name", "title")
+        if label_raw is None:
+            continue
+        label = str(label_raw).strip().lower()
+        if not label:
+            continue
+        value = _first_present(entry, "value", "display_value", "text_value", "description")
+        flattened[label] = value
+    return flattened
 
-        cards = soup.select('div[data-testid="unique-property-ad-container"]')
-        for card in cards:
-            price_el = card.select_one('[data-testid="unique-ad-price"]')
-            link_el = card.select_one('a[data-testid="unique-ad-url"]')
-            if not link_el or not link_el.get("href"):
+
+def find_characteristics_container(node: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(node.get("characteristics_list"), list):
+        return node
+    for key in ("result", "t", "listing", "property", "details"):
+        child = node.get(key)
+        if isinstance(child, dict) and isinstance(child.get("characteristics_list"), list):
+            return child
+    return node
+
+
+def _extract_photo_urls(node: dict[str, Any]) -> list[str]:
+    photo_urls: list[str] = []
+    photos = node.get("photos")
+    if isinstance(photos, list):
+        for photo in photos:
+            if isinstance(photo, str) and photo:
+                photo_urls.append(photo)
+            elif isinstance(photo, dict):
+                url = _first_present(photo, "url", "src", "image_url", "large", "original")
+                if url:
+                    photo_urls.append(str(url))
+
+    image_gallery = node.get("image_gallery")
+    if isinstance(image_gallery, list):
+        for image in image_gallery:
+            if isinstance(image, str) and image:
+                photo_urls.append(image)
                 continue
+            if not isinstance(image, dict):
+                continue
+            for branch in ("fullscreen", "big", "medium", "small", "thumbnail"):
+                branch_value = image.get(branch)
+                if isinstance(branch_value, dict):
+                    url = _first_present(branch_value, "jpeg", "webp", "jpg", "url")
+                    if url:
+                        photo_urls.append(str(url))
+                        break
+    return list(dict.fromkeys(photo_urls))
 
-            full = urljoin(BASE_URL, link_el["href"])
-            p = parse_number(price_el.get_text(strip=True)) if price_el else None
 
-            if best_url is None:
-                best_url, best_price = full, p
-            else:
-                if p is not None and (best_price is None or p < best_price):
-                    best_url, best_price = full, p
+def extract_discovery_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in DISCOVERY_ITEM_KEYS:
+        value = payload.get(key)
+        if isinstance(value, list):
+            if key != "items":
+                logger.info("Discovery items extracted from response key '%s'.", key)
+            return [item for item in value if isinstance(item, dict)]
+    return []
 
-        if best_url:
-            return best_url
 
-        # Fallback: any link that looks like a listing
-        a = soup.select_one('a[href*="/property/d/property-for-sale/"], a[href*="/property-for-sale/"]')
-        if a and a.get("href"):
-            return urljoin(BASE_URL, a["href"])
-
+def extract_property_id(item: dict[str, Any]) -> str | None:
+    raw_id = _first_present(item, "id", "result_id", "ad_id", "listing_id")
+    if raw_id is None:
         return None
-
-    except Exception as e:
-        print(f"[WARN] Failed to resolve group page {group_url}: {e}")
-        return None
-    finally:
-        await group_page.close()
+    text = str(raw_id).strip()
+    return text or None
 
 
-async def extract_result_links(page: Page, html: str) -> list[str]:
-    """
-    Extract listing URLs from search result HTML.
-    Also resolves '/u/' group URLs to a single best-price variant.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Dedup within the page by normalized key
-    by_key: dict[str, dict] = {}
-
-    for a in soup.select('a[data-testid="property-ad-url"]'):
-        href = a.get("href")
-        if not href:
-            continue
-
-        full_url = urljoin(BASE_URL, href)
-        key = normalize_property_url(href)
-
-        if key not in by_key:
-            by_key[key] = {
-                "url": full_url,
-                "kind": "multiple" if "/u/" in full_url else "single",
-            }
-
-    items = list(by_key.values())
-
-    # Resolve group URLs in parallel (max 3 at a time to avoid detection)
-    group_sem = asyncio.Semaphore(3)
-
-    async def resolve_item(item: dict) -> str | None:
-        u = item["url"]
-        if item["kind"] != "multiple":
-            return u
-        async with group_sem:
-            resolved = await resolve_group_best_price_variant(page.context, u)
-            return resolved or u  # fallback: keep original so we don't silently drop
-
-    resolved_items = await asyncio.gather(*[resolve_item(item) for item in items])
-    return [u for u in resolved_items if u]
+def extract_address_parts(node: dict[str, Any]) -> tuple[str | None, str | None]:
+    separated = node.get("address_separated")
+    if isinstance(separated, list):
+        municipality = str(separated[0]).strip() if len(separated) > 0 and separated[0] else None
+        area_raw = str(separated[1]).strip() if len(separated) > 1 and separated[1] else None
+        return municipality, area_raw
+    if isinstance(separated, dict):
+        municipality = _first_present(separated, "municipality", "city", "region")
+        area_raw = _first_present(separated, "area", "neighborhood", "district")
+        return (
+            str(municipality).strip() if municipality else None,
+            str(area_raw).strip() if area_raw else None,
+        )
+    return None, None
 
 
-# -----------------------------
-# Listing page parsing
-# -----------------------------
-
-def parse_listing_html(html: str, url: str) -> dict:
-    soup = BeautifulSoup(html, "html.parser")
-
-    data = {
-        "url": url,
-        "source": "xe.gr",
-        "scraped_at": datetime.utcnow().isoformat(),
-
-        "Headline": None,
-        "price_eur": None,
-        "price_per_sqm": None,
-        "area_sqm": None,
-
-        # Single canonical scoring field + prefix-only category
-        "neighborhood": None,
-        "area": None,  # prefix only (Ano/Kato/Nea/Neo) or None
-
-        "address_raw": None,
-
-        "bedrooms": None,
-        "bathrooms": None,
-        "floor": None,
-        "year_built": None,
-        "renovation_year": None,
-        "energy_class": None,
-
-        "photos_count": None,
-        "photo_urls": [],
-        "publication_date": None,
-    }
-
-    # Title + area
-    title_el = soup.select_one('[data-testid="basic-info"] .title .section-heading')
-    if title_el:
-        title = title_el.get_text(strip=True)
-        data["Headline"] = title
-        data["area_sqm"] = parse_area_from_title(title)
-
-    # Price
-    price_el = soup.select_one('[data-testid="basic-info"] .price .section-heading')
-    if price_el:
-        data["price_eur"] = parse_number(price_el.get_text(strip=True))
-
-    # price_per_sqm from price and parsed area
-    if data["price_eur"] and data["area_sqm"] and data["area_sqm"] > 0:
-        data["price_per_sqm"] = round(data["price_eur"] / data["area_sqm"], 2)
-
-    # Address -> neighborhood + prefix-only area
-    addr_el = soup.select_one('[data-testid="basic-info"] .address')
-    if addr_el:
-        municipality, area_raw, raw = parse_location_from_address_element(addr_el)
-        data["address_raw"] = raw
-
-        neighborhood, prefix = resolve_neighborhood_and_prefix(municipality, area_raw)
-        data["neighborhood"] = neighborhood
-        data["area"] = prefix
-
-    # Characteristics
-    for li in soup.select('[data-testid="characteristics"] [data-testid="characteristic"]'):
-        txt = li.get_text(" ", strip=True)
-
-        if txt.startswith("Bedrooms:"):
-            data["bedrooms"] = parse_first_int(txt)
-        elif txt.startswith("Bathrooms:") or txt.startswith("WC:"):
-            data["bathrooms"] = parse_first_int(txt) or 0
-        elif txt.startswith("Floor:"):
-            data["floor"] = parse_floor(txt)
-        elif txt.startswith("Year Built:"):
-            data["year_built"] = parse_first_int(txt)
-        elif txt.startswith("Renovation year:"):
-            data["renovation_year"] = parse_first_int(txt)
-        elif txt.startswith("Energy Class:"):
-            raw_ec = txt.split(":", 1)[1].strip() if ":" in txt else txt
-            data["energy_class"] = normalize_energy_class(raw_ec)
-
-    # Photos
-    photo_urls = [
-        div.get("data-url")
-        for div in soup.select("div.common-property-ad-image[data-testid^='gallery-ad-image']")
-        if div.get("data-url")
-    ]
-    data["photo_urls"] = photo_urls
-
-    count_el = soup.select_one(".xe-gallery-expand + span")
-    if count_el:
-        data["photos_count"] = parse_number(count_el.get_text(strip=True))
-    elif photo_urls:
-        # Fallback: count from the gallery divs we already extracted
-        data["photos_count"] = len(photo_urls)
-
-    # Publication date (Statistics section)
-    stats_section = soup.select_one('section[data-testid="statistics"]')
-    if stats_section:
-        pub_date_iso = None
-        for p in stats_section.select("p"):
-            t = p.get_text(" ", strip=True)
-            if t.startswith("Publication Date") or t.startswith("Last publication date"):
-                span = p.find("span")
-                if span:
-                    raw_date = span.get_text(strip=True)  # e.g. "October 3, 2025"
-                    try:
-                        dt = datetime.strptime(raw_date, "%B %d, %Y")
-                        pub_date_iso = dt.date().isoformat()
-                    except ValueError:
-                        pub_date_iso = raw_date
-                break
-        data["publication_date"] = pub_date_iso
-
-    return data
+def _cookies_have_valid_entry(cookies: list[dict[str, Any]]) -> bool:
+    if not cookies:
+        return False
+    now = time.time()
+    for cookie in cookies:
+        expires = cookie.get("expires")
+        if not isinstance(expires, (int, float)):
+            return True
+        if expires <= 0 or expires > now:
+            return True
+    return False
 
 
-async def wait_for_full_listing_dom(page: Page) -> None:
-    """Wait for at least one strong selector that indicates the listing is fully rendered."""
-    selectors = [
-        '[data-testid="statistics"]',
-        '[data-testid="characteristics"]',
-        '[data-testid="basic-info"] .section-heading',
-    ]
-    for sel in selectors:
+def _is_dns_or_connection_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "could not resolve host" in msg
+        or "name or service not known" in msg
+        or "temporary failure in name resolution" in msg
+        or "connection" in msg
+        or "failed to perform" in msg
+    )
+
+
+async def _ensure_cookies_with_optional_force(force: bool) -> list[dict[str, Any]]:
+    if force and COOKIES_PATH.exists():
+        COOKIES_PATH.unlink()
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
         try:
-            await page.wait_for_selector(sel, timeout=8000)
-            return
-        except TimeoutError:
-            continue
-    raise TimeoutError("Listing page did not reach expected DOM selectors.")
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            for attempt in range(1, 4):
+                try:
+                    await page.goto(RESULTS_REFERER, wait_until="domcontentloaded", timeout=45000)
+                except Exception as exc:
+                    logger.warning("Cookie bootstrap navigation failed (attempt=%s): %s", attempt, exc)
+
+                await page.wait_for_timeout(8000 + attempt * 2000)
+                title = (await page.title()).strip().lower()
+                content_sample = (await page.content())[:8000].lower()
+                blocked = "human verification" in title or "awswafcookiedomainlist" in content_sample
+                cookies = await context.cookies()
+                if cookies and not blocked:
+                    COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with COOKIES_PATH.open("w", encoding="utf-8") as fh:
+                        json.dump(cookies, fh, ensure_ascii=False, indent=2)
+                    logger.info("Auto-captured %s cookies via Playwright.", len(cookies))
+                    return cookies
+                logger.warning("Cookie bootstrap still blocked (attempt=%s). Retrying...", attempt)
+
+            cookies = await context.cookies()
+            if cookies:
+                COOKIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with COOKIES_PATH.open("w", encoding="utf-8") as fh:
+                    json.dump(cookies, fh, ensure_ascii=False, indent=2)
+                logger.info("Saved %s fallback cookies after blocked bootstrap.", len(cookies))
+                return cookies
+
+            raise RuntimeError("Auto cookie bootstrap failed: no cookies captured.")
+        finally:
+            await browser.close()
 
 
-async def scrape_listing_details(context: BrowserContext, url: str) -> dict:
-    """Open a listing page and parse its HTML."""
-    # Skip unresolved group URLs like '/property/u/123456' – they are already
-    # handled at the search-results level by resolve_group_best_price_variant.
-    path = urlsplit(url).path
-    if "/property/u/" in path:
-        print(f"[SKIP] Skipping unresolved group URL {url}")
+async def get_valid_cookies(force: bool = False) -> list[dict[str, Any]]:
+    if force:
+        logger.info("Forced cookie refresh requested.")
+        return await _ensure_cookies_with_optional_force(force=True)
+
+    try:
+        cookies = load_cookies(COOKIES_PATH)
+    except FileNotFoundError:
+        logger.info("cookies.json missing. Capturing fresh cookies via Playwright.")
+        return await _ensure_cookies_with_optional_force(force=False)
+    except Exception as exc:
+        logger.warning("cookies.json unreadable (%s). Re-capturing cookies.", exc)
+        return await _ensure_cookies_with_optional_force(force=False)
+
+    if _cookies_have_valid_entry(cookies):
+        logger.info("Reusing existing cookies from %s", COOKIES_PATH)
+        return cookies
+
+    # Session hygiene: keep using existing cookie jar until blocked errors explicitly trigger force refresh.
+    logger.warning("cookies.json appears expired; reusing until blocked response triggers forced refresh.")
+    return cookies
+
+
+def build_impersonated_session(cookies: list[dict[str, Any]]) -> requests.Session:
+    session = requests.Session(impersonate="chrome124")
+    cookie_dict = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+    session.cookies.update({k: v for k, v in cookie_dict.items() if v is not None})
+    csrf_token = str(cookie_dict.get("csrf_token", "") or "")
+    session.headers.update(
+        {
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "referer": RESULTS_REFERER,
+            "x-requested-with": "XMLHttpRequest",
+            "x-csrf-token": csrf_token,
+            "user-agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        }
+    )
+    return session
+
+
+async def get_impersonated_session(force_cookies: bool = False) -> requests.Session:
+    cookies = await get_valid_cookies(force=force_cookies)
+    return build_impersonated_session(cookies)
+
+
+async def discover_ids(
+    runtime: "ScraperRuntime",
+    page: int,
+    min_price: int,
+    max_price: int,
+    geo_place_id: str,
+) -> list[str]:
+    search_url = build_xe_url(
+        min_price=min_price,
+        max_price=max_price,
+        geo_place_id=geo_place_id,
+        page=page,
+    )
+    parsed_params = parse_qs(urlsplit(search_url).query, keep_blank_values=True)
+    params: dict[str, Any] = {
+        key: values if len(values) > 1 else values[0]
+        for key, values in parsed_params.items()
+    }
+    for attempt in range(1, DISCOVERY_MAX_RETRIES + 1):
+        try:
+            response = await asyncio.to_thread(runtime.session.get, MAP_SEARCH_URL, params=params, timeout=30)
+        except Exception as exc:
+            if _is_dns_or_connection_error(exc):
+                logger.warning(
+                    "Discovery network failure page=%s attempt=%s err=%s. Cooling 60s + cookie refresh.",
+                    page,
+                    attempt,
+                    exc,
+                )
+                await asyncio.sleep(60)
+                await runtime.refresh_session_cookies(force=True)
+                if attempt < DISCOVERY_MAX_RETRIES:
+                    continue
+                return []
+            logger.warning("Discovery request exception page=%s attempt=%s err=%s", page, attempt, exc)
+            if attempt < DISCOVERY_MAX_RETRIES:
+                await asyncio.sleep(DETAIL_RETRY_BASE_DELAY * attempt)
+                continue
+            return []
+
+        if response.status_code in (403, 405, 429):
+            logger.warning("Discovery blocked page=%s status=%s attempt=%s", page, response.status_code, attempt)
+            await runtime.refresh_session_cookies(force=True)
+            if attempt < DISCOVERY_MAX_RETRIES:
+                # 405 means the server flagged the session; use a much longer back-off.
+                backoff = 45.0 * attempt if response.status_code == 405 else DETAIL_RETRY_BASE_DELAY * attempt
+                logger.info("Discovery back-off %.0fs before retry (page=%s attempt=%s).", backoff, page, attempt)
+                await asyncio.sleep(backoff)
+                continue
+            return []
+
+        if response.status_code != 200:
+            logger.error("Discovery failed on page %s with status=%s", page, response.status_code)
+            return []
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.error("Discovery JSON parse failed on page %s.", page)
+            return []
+
+        items = extract_discovery_items(payload) if isinstance(payload, dict) else []
+        if not items:
+            if isinstance(payload, dict):
+                logger.warning("Discovery returned no items on page %s. Response keys: %s", page, sorted(payload.keys()))
+            else:
+                logger.warning("Discovery returned unexpected payload type: %s", type(payload).__name__)
+            return []
+        return [listing_id for item in items if (listing_id := extract_property_id(item))]
+    return []
+
+
+def load_local_listings() -> dict[str, dict[str, Any]]:
+    if not LISTINGS_JSON.exists():
+        return {}
+    try:
+        with LISTINGS_JSON.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            logger.warning("Existing listings file is not a list. Starting with empty store.")
+            return {}
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            canonical_url = normalize_listing_url(item.get("url"))
+            if canonical_url:
+                deduped[canonical_url] = item
+        return deduped
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.error("Failed reading %s: %s", LISTINGS_JSON, exc)
         return {}
 
-    page = await context.new_page()
+
+def save_local_listings(listings_store: dict[str, dict[str, Any]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    rows = list(listings_store.values())
+    rows.sort(key=lambda row: str(row.get("url", "")))
+    with LISTINGS_JSON.open("w", encoding="utf-8") as fh:
+        json.dump(rows, fh, ensure_ascii=False, indent=2)
+
+
+def get_listing_payload(detail_node: dict[str, Any], chars: dict[str, Any]) -> dict[str, Any] | None:
+    url = _first_present(detail_node, "url", "seo_url")
+    canonical_url = normalize_listing_url(url)
+    if not canonical_url:
+        return None
+
+    municipality, area_raw = extract_address_parts(detail_node)
+    neighborhood = resolve_neighborhood(municipality, area_raw)
+    photo_urls = _extract_photo_urls(detail_node)
+
+    listing = {
+        "url": str(url).strip(),
+        "Headline": _first_present(detail_node, "title", "headline")
+        or _deep_first(detail_node, ("title", "headline")),
+        "price_eur": clean_price_eur(
+            _first_present(detail_node, "price", "price_value") or _deep_first(detail_node, ("price", "price_value"))
+        ),
+        "price_per_sqm": clean_float(
+            _first_present(detail_node, "price_per_sqm", "price_sqm", "price_per_square_meter", "price_per_unit_area")
+            or _deep_first(detail_node, ("price_per_sqm", "price_sqm", "price_per_square_meter", "price_per_unit_area"))
+        ),
+        "area_sqm": clean_float(
+            _first_present(detail_node, "size_with_square_meter", "size", "sqm")
+            or _deep_first(detail_node, ("size_with_square_meter", "size", "sqm"))
+        ),
+        "municipality": municipality,
+        "neighborhood": neighborhood,
+        "address_raw": _first_present(detail_node, "address", "address_full")
+        or _deep_first(detail_node, ("address", "address_full")),
+        "bedrooms": clean_int(
+            _first_present(detail_node, "bedrooms", "bedrooms_count")
+            or _deep_first(detail_node, ("bedrooms", "bedrooms_count"))
+        ),
+        "bathrooms": clean_int(
+            _first_present(detail_node, "bathrooms", "bathrooms_count")
+            or _deep_first(detail_node, ("bathrooms", "bathrooms_count"))
+        ),
+        "floor": clean_floor(_first_present(chars, "floor")),
+        "year_built": clean_int(
+            _first_present(chars, "year built", "year of construction", "construction year")
+            or _first_present(detail_node, "construction_year")
+            or _deep_first(detail_node, ("construction_year",))
+        ),
+        "renovation_year": clean_int(_first_present(chars, "renovation year")),
+        "energy_class": _first_present(chars, "energy class"),
+        "photos_count": clean_int(_first_present(detail_node, "photos_count") or _deep_first(detail_node, ("photos_count",)))
+        or len(photo_urls),
+        "photo_urls": photo_urls,
+        "publication_date": normalize_publication_date(
+            _first_present(detail_node, "published_at", "publication_date", "publication_start_date", "date")
+            or _deep_first(detail_node, ("published_at", "publication_date", "publication_start_date", "date"))
+        ),
+        "latitude": clean_float(
+            _first_present(detail_node, "geo_lat", "latitude") or _deep_first(detail_node, ("geo_lat", "latitude"))
+        ),
+        "longitude": clean_float(
+            _first_present(detail_node, "geo_lng", "longitude") or _deep_first(detail_node, ("geo_lng", "longitude"))
+        ),
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return listing
+
+
+class ScraperRuntime:
+    def __init__(self, session: requests.Session, concurrency: int) -> None:
+        self.session = session
+        self.sem = asyncio.Semaphore(concurrency)
+        self.cookie_refresh_lock = asyncio.Lock()
+
+    async def refresh_session_cookies(self, force: bool) -> None:
+        async with self.cookie_refresh_lock:
+            cookies = await get_valid_cookies(force=force)
+            if force:
+                # Full rebuild: new TLS connection pool + new cookies — avoids reusing a flagged session.
+                self.session = build_impersonated_session(cookies)
+                logger.info("Session fully rebuilt after forced cookie refresh.")
+            else:
+                cookie_dict = {c.get("name"): c.get("value") for c in cookies if c.get("name")}
+                self.session.cookies.clear()
+                self.session.cookies.update({k: v for k, v in cookie_dict.items() if v is not None})
+                self.session.headers["x-csrf-token"] = str(cookie_dict.get("csrf_token", "") or "")
+
+
+def _extract_unit_photo_urls(unit: dict[str, Any]) -> list[str]:
+    """Extract photo URLs from a unit dict using the same logic as _extract_photo_urls plus extra keys."""
+    # Reuse the main extractor (handles photos + image_gallery with nested branches)
+    urls: list[str] = _extract_photo_urls(unit)
+
+    # Also check extra keys that units sometimes use
+    for key in ("media", "images", "gallery", "pictures", "media_gallery"):
+        collection = unit.get(key)
+        if not isinstance(collection, list):
+            continue
+        for item in collection:
+            if isinstance(item, str) and item:
+                urls.append(item)
+            elif isinstance(item, dict):
+                url = _first_present(item, "url", "src", "image_url", "large", "original", "media_url", "jpeg", "webp")
+                if url:
+                    urls.append(str(url))
+    return list(dict.fromkeys(urls))
+
+
+async def _fetch_ad_group_units(runtime: "ScraperRuntime", ad_group_id: str) -> list[dict[str, Any]]:
+    """Call unique_properties and return the list of unit dicts (one HTTP call, no sub-URL navigation)."""
+    params = {
+        "ad_group_id": ad_group_id,
+        "transaction_name": "buy",
+        "item_type": "re_residence",
+    }
     try:
-        attempts = 0
-        while True:
-            attempts += 1
-            try:
-                # domcontentloaded is much faster than networkidle — we do our
-                # own DOM-ready check via wait_for_full_listing_dom instead.
-                await page.goto(url, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-                try:
-                    await wait_for_full_listing_dom(page)
-                except TimeoutError:
-                    if await is_verification_page(page):
-                        await wait_for_user_to_solve_verification(
-                            page,
-                            success_selector='[data-testid="basic-info"] .section-heading',
-                            timeout_ms=120_000,
-                        )
-                        await wait_for_full_listing_dom(page)
-                    else:
-                        raise
-                html = await page.content()
-                return parse_listing_html(html, url)
-            except TimeoutError as e:
-                if attempts >= 2:
-                    print(f"[WARN] Giving up on {url} after {attempts} attempts due to timeout: {e}")
-                    raise
-                print(f"[RETRY] Timeout loading {url}, retrying ({attempts}/2)...")
-                continue
-    finally:
-        await page.close()
+        response = await asyncio.to_thread(runtime.session.get, AD_GROUP_URL, params=params, timeout=30)
+    except Exception as exc:
+        logger.warning("unique_properties fetch failed ad_group_id=%s: %s", ad_group_id, exc)
+        return []
+    if response.status_code != 200:
+        logger.warning("unique_properties status=%s ad_group_id=%s", response.status_code, ad_group_id)
+        return []
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.warning("unique_properties JSON parse failed ad_group_id=%s", ad_group_id)
+        return []
+    if isinstance(payload, list):
+        return [u for u in payload if isinstance(u, dict)]
+    if isinstance(payload, dict):
+        for key in ("results", "items", "units", "properties", "ads"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [u for u in value if isinstance(u, dict)]
+    return []
 
 
-async def scrape_all_listings_to_json(
-    context: BrowserContext,
-    listing_urls: list[str],
-    max_concurrent: int = DETAIL_CONCURRENCY,
-) -> None:
+def _build_hybrid_detail_node(
+    base_node: dict[str, Any],
+    units: list[dict[str, Any]],
+    ad_group_id: str,
+) -> tuple[dict[str, Any], Any]:
     """
-    Scrape all listing URLs and merge results into data/listings.json (deduped).
-    Uses a concurrency limit so multiple listing pages are fetched in parallel.
+    Synthesise one best record from all units in an ad group:
+      • price, area_sqm, floor, url  ← cheapest unit (price > 0)
+      • photos                        ← unit with the most photos
+
+    Returns (merged_detail_node, raw_floor_value_for_chars_override).
+    raw_floor_value is None when no cheapest unit was found.
     """
-    if not listing_urls:
-        print("[DETAIL] No listing URLs to scrape.")
-        return
+    if not units:
+        return base_node, None
 
-    sem = asyncio.Semaphore(max_concurrent)
+    def _unit_price(u: dict[str, Any]) -> float:
+        raw = _first_present(u, "price", "price_eur", "price_value", "final_price")
+        p = clean_price_eur(raw)
+        return p if p and p > 0 else float("inf")
 
-    async def scrape_one(i: int, url: str) -> dict | None:
-        async with sem:
-            print(f"[DETAIL] ({i}/{len(listing_urls)}) {url}")
+    cheapest = min(units, key=_unit_price)
+    cheapest_price = _unit_price(cheapest)
+    has_valid_price = cheapest_price < float("inf")
+
+    most_photos = max(units, key=lambda u: len(_extract_unit_photo_urls(u)))
+    best_photos = _extract_unit_photo_urls(most_photos)
+
+    merged = dict(base_node)
+    raw_floor = None
+
+    if has_valid_price:
+        raw_price = _first_present(cheapest, "price", "price_eur", "price_value", "final_price")
+        if raw_price is not None:
+            merged["price"] = raw_price
+
+        raw_size = _first_present(cheapest, "size_with_square_meter", "size", "area_sqm", "sqm", "area")
+        if raw_size is not None:
+            merged["size_with_square_meter"] = raw_size
+
+        raw_floor = _first_present(cheapest, "floor")
+
+        unit_url = _first_present(cheapest, "url", "seo_url", "link")
+        if unit_url:
+            merged["url"] = unit_url
+            merged["seo_url"] = unit_url
+
+    if best_photos:
+        merged["photos"] = best_photos
+        merged["image_gallery"] = []  # prevent _extract_photo_urls from mixing in stale gallery
+
+    logger.info(
+        "Ad group %s: %s units — cheapest=%.0f€  best_photos=%s",
+        ad_group_id,
+        len(units),
+        cheapest_price if has_valid_price else 0,
+        len(best_photos),
+    )
+    if not best_photos and units:
+        logger.warning(
+            "Ad group %s: photos still 0 after extraction. Sample unit top-level keys: %s",
+            ad_group_id,
+            sorted(units[0].keys()),
+        )
+    return merged, raw_floor
+
+
+async def fetch_listing_detail(runtime: ScraperRuntime, result_id: str) -> dict[str, Any] | None:
+    params = {
+        "result_id": result_id,
+        "item_type": "re_residence",
+        "transaction_name": "buy",
+    }
+
+    async with runtime.sem:
+        await asyncio.sleep(random.uniform(5.0, 10.0))
+        for attempt in range(1, DETAIL_MAX_RETRIES + 1):
             try:
-                return await scrape_listing_details(context, url)
-            except Exception as e:
-                print(f"[WARN] Failed to scrape {url}: {e}")
+                response = await asyncio.to_thread(runtime.session.get, SINGLE_RESULT_URL, params=params, timeout=30)
+            except Exception as exc:
+                if _is_dns_or_connection_error(exc):
+                    logger.warning(
+                        "single_result DNS/connection error for id=%s attempt=%s err=%s. Cooling 60s + cookie refresh.",
+                        result_id,
+                        attempt,
+                        exc,
+                    )
+                    await asyncio.sleep(60)
+                    await runtime.refresh_session_cookies(force=True)
+                    if attempt < DETAIL_MAX_RETRIES:
+                        continue
+                    return None
+                logger.warning("single_result request exception for id=%s attempt=%s err=%s", result_id, attempt, exc)
+                if attempt < DETAIL_MAX_RETRIES:
+                    await asyncio.sleep(DETAIL_RETRY_BASE_DELAY * attempt)
+                    continue
                 return None
 
-    tasks = [
-        asyncio.create_task(scrape_one(i, url))
-        for i, url in enumerate(listing_urls, start=1)
-    ]
-    raw_results = await asyncio.gather(*tasks)
-    results: list[dict] = [r for r in raw_results if r is not None]
+            if response.status_code in (403, 405, 429):
+                logger.warning("single_result throttled id=%s status=%s attempt=%s", result_id, response.status_code, attempt)
+                await runtime.refresh_session_cookies(force=True)
+                if attempt < DETAIL_MAX_RETRIES:
+                    backoff = 45.0 * attempt if response.status_code == 405 else DETAIL_RETRY_BASE_DELAY * attempt
+                    logger.info("single_result back-off %.0fs id=%s.", backoff, result_id)
+                    await asyncio.sleep(backoff)
+                    continue
+                return None
 
-    out_path = DATA_DIR / "listings.json"
+            if response.status_code != 200:
+                logger.warning("single_result failed for id=%s status=%s", result_id, response.status_code)
+                return None
 
-    # Load existing
-    existing: list[dict] = []
-    if out_path.exists():
-        try:
-            with out_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                existing = data
-        except Exception as e:
-            print(f"[WARN] Failed to load existing listings.json: {e}")
+            try:
+                payload = response.json()
+            except ValueError:
+                logger.warning("single_result JSON parse failed for id=%s", result_id)
+                return None
 
-    # Merge by normalized listing URL
-    by_key: dict[str, dict] = {}
-    for item in existing:
-        u = item.get("url")
-        if u:
-            by_key[normalize_listing_url(u)] = item
+            if not isinstance(payload, dict):
+                logger.warning("single_result payload is not dict for id=%s", result_id)
+                return None
 
-    for item in results:
-        u = item.get("url")
-        if u:
-            by_key[normalize_listing_url(u)] = item  # new overwrites old
+            detail_node = payload.get("result")
+            if not isinstance(detail_node, dict):
+                detail_node = payload.get("t")
+            if not isinstance(detail_node, dict):
+                logger.warning("single_result missing usable detail node for id=%s keys=%s", result_id, sorted(payload.keys()))
+                return None
 
-    combined = list(by_key.values())
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(combined, f, ensure_ascii=False, indent=2)
-
-    print(f"[INFO] Wrote {len(results)} new listings, total {len(combined)} unique -> {out_path}")
-
-
-# -----------------------------
-# Pagination collector
-# -----------------------------
-
-async def collect_all_listing_urls_across_pages(
-    page: Page,
-    start_page: int,
-    max_pages: int | None,
-) -> tuple[list[str], int]:
-    """
-    Collect listing URLs across pages.
-    Returns (urls, last_page_scraped).
-    """
-    all_urls: list[str] = []
-    page_index = start_page
-    pages_visited = 0
-
-    while True:
-        print(f"[PAGE] Collecting from page {page_index}...")
-
-        await ensure_no_verification_blocking(page)
-        try:
-            await load_all_search_results(page)
-        except TimeoutError:
-            if await is_verification_page(page):
-                print("[WARN] Bot verification detected during scroll.")
-                await wait_for_user_to_solve_verification(page)
-                await load_all_search_results(page)
+            # ── Ad Group: hybrid selection (cheapest price + most photos) ──
+            ad_group_id = _first_present(detail_node, "ad_group_id")
+            if ad_group_id:
+                logger.info("id=%s belongs to ad_group=%s — fetching all units.", result_id, ad_group_id)
+                units = await _fetch_ad_group_units(runtime, str(ad_group_id))
+                if units:
+                    detail_node, raw_floor = _build_hybrid_detail_node(detail_node, units, str(ad_group_id))
+                    chars = flatten_characteristics(find_characteristics_container(detail_node))
+                    if raw_floor is not None:
+                        chars["floor"] = raw_floor
+                else:
+                    logger.warning("Ad group %s returned no units — using base listing.", ad_group_id)
+                    chars = flatten_characteristics(find_characteristics_container(detail_node))
             else:
-                print("[WARN] Timeout during scroll; continuing with listings found so far.")
+                chars = flatten_characteristics(find_characteristics_container(detail_node))
+            # ────────────────────────────────────────────────────────────────
 
-        html = await page.content()
-        urls = await extract_result_links(page, html)
-        all_urls.extend(urls)
-
-        pages_visited += 1
-        if max_pages is not None and pages_visited >= max_pages:
-            print(f"[PAGE] Reached max_pages={max_pages}, stopping pagination.")
-            break
-
-        next_btn = page.locator(
-            "nav[data-testid='pagination'] li.pager-next a[rel='next'][aria-disabled='false']"
-        )
-        if await next_btn.count() == 0:
-            print("[PAGE] No enabled NEXT button found; finished.")
-            break
-
-        await next_btn.first.click()
-        try:
-            await page.wait_for_load_state("load", timeout=12000)
-        except TimeoutError:
-            if await is_verification_page(page):
-                print("[WARN] Bot verification detected after page navigation.")
-                await wait_for_user_to_solve_verification(page)
-            else:
-                print("[WARN] Timeout after next page click; continuing anyway.")
-
-        await page.wait_for_timeout(400)
-        page_index += 1
-
-    print(f"[PAGE] Collected {len(all_urls)} raw listing URLs from {pages_visited} pages (last page={page_index}).")
-    return all_urls, page_index
+            listing = get_listing_payload(detail_node, chars)
+            if not listing:
+                logger.warning("Listing payload missing valid URL for id=%s", result_id)
+                return None
+            logger.info("Scraped id=%-10s  %s", result_id, listing.get("url", "—"))
+            return listing
+    return None
 
 
-# -----------------------------
-# Main batch runner
-# -----------------------------
+async def run_scrape_cycle(
+    max_pages: int = DEFAULT_MAX_PAGES,
+    min_price: int = DEFAULT_MIN_PRICE,
+    max_price: int = DEFAULT_MAX_PRICE,
+    geo_place_id: str = ATHENS_CENTER_ID,
+) -> None:
+    session = await get_impersonated_session()
+    runtime = ScraperRuntime(session=session, concurrency=3)
 
-async def main_batch(max_pages_per_batch: int = 5) -> None:
-    """
-    One batch run:
-    - start from last_page + 1 (state.json)
-    - collect URLs across N pages
-    - save last_page
-    - dedupe URLs
-    - scrape details and merge into listings.json
-    """
-    last_page = load_last_page()
-    start_page = last_page + 1 if last_page > 0 else 1
-    print(f"[STATE] last_page={last_page} -> starting from page={start_page}")
+    listings_store = load_local_listings()
+    logger.info("Loaded %s existing listings from JSON store.", len(listings_store))
 
-    start_url = url_builder.build_xe_url(
-        min_price=30000,
-        max_price=60000,
-        building_type="apartment",
-        has_photos=True,
-        page=start_page,
+    processed_since_save = 0
+    total_updated = 0
+    consecutive_empty = 0
+
+    for page in range(1, max_pages + 1):
+        logger.info("Stage 1 Discovery: page=%s", page)
+        ids = await discover_ids(runtime, page=page, min_price=min_price, max_price=max_price, geo_place_id=geo_place_id)
+        logger.info("Discovery page=%s returned %s IDs.", page, len(ids))
+        if not ids:
+            consecutive_empty += 1
+            if consecutive_empty >= 3:
+                logger.warning(
+                    "%s consecutive empty discovery pages — likely blocked. Rebuilding session and sleeping 120s.",
+                    consecutive_empty,
+                )
+                await runtime.refresh_session_cookies(force=True)
+                await asyncio.sleep(120)
+                consecutive_empty = 0
+            continue
+        consecutive_empty = 0
+
+        logger.info("Stage 2 Enrichment: running %s IDs with concurrency=%s", len(ids), 3)
+        tasks = [fetch_listing_detail(runtime, listing_id) for listing_id in ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        total_on_page = len(ids)
+        for idx, (listing_id, result) in enumerate(zip(ids, results), 1):
+            if isinstance(result, Exception):
+                logger.exception("[%s/%s] Unexpected enrichment error for id=%s: %s", idx, total_on_page, listing_id, result)
+                continue
+            if not result:
+                logger.warning("[%s/%s] No data for id=%s", idx, total_on_page, listing_id)
+                continue
+
+            canonical_url = normalize_listing_url(result.get("url"))
+            if not canonical_url:
+                continue
+            listings_store[canonical_url] = result
+            total_updated += 1
+            processed_since_save += 1
+            logger.info("[%s/%s page=%s] Stored #%s: %s", idx, total_on_page, page, total_updated, canonical_url)
+
+            if processed_since_save >= BATCH_COMMIT_SIZE:
+                save_local_listings(listings_store)
+                logger.info("Batch saved %s updates (store size=%s).", processed_since_save, len(listings_store))
+                processed_since_save = 0
+
+        save_local_listings(listings_store)
+        logger.info("Saved after page=%s (store size=%s).", page, len(listings_store))
+        if page % 3 == 0:
+            logger.info("Cooldown after page %s: sleeping 120 seconds.", page)
+            await asyncio.sleep(120)
+
+    if processed_since_save > 0:
+        save_local_listings(listings_store)
+
+    logger.info(
+        "Scrape finished. Updated listings=%s, total deduplicated records=%s, output=%s",
+        total_updated,
+        len(listings_store),
+        LISTINGS_JSON,
     )
-    print(f"[INFO] Start URL: {start_url}")
-
-    async with async_playwright() as p:
-        cookies = await ensure_cookies(
-            playwright=p,
-            cookies_path=COOKIES_PATH,
-            start_url=start_url,
-            auto_capture=True,
-        )
-        print(f"[INFO] Loaded {len(cookies)} cookies")
-
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        await context.add_cookies(cookies)
-
-        page = await context.new_page()
-        await page.goto(start_url, wait_until="domcontentloaded")
-        await page.wait_for_timeout(400)
-
-        await ensure_no_verification_blocking(page)
-
-        raw_urls, last_page_scraped = await collect_all_listing_urls_across_pages(
-            page,
-            start_page=start_page,
-            max_pages=max_pages_per_batch,
-        )
-
-        save_last_page(last_page_scraped)
-
-        resolved_urls = dedupe_listing_urls(raw_urls)
-        await scrape_all_listings_to_json(context, resolved_urls)
-
-        await browser.close()
-
-
-async def run_multiple_batches(num_batches, max_pages_per_batch) -> None:
-    """Run multiple batches sequentially (uses state.json to continue)."""
-    for batch in range(1, num_batches + 1):
-        print(f"\n========== BATCH {batch}/{num_batches} ==========\n")
-        try:
-            await main_batch(max_pages_per_batch=max_pages_per_batch)
-        except Exception as e:
-            print(f"[ERROR] Batch {batch} failed: {e}")
-            break
-        await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
-    # Tune these:
-    # - num_batches: how many cycles to run
-    # - max_pages_per_batch: how many result pages to scan per cycle
-    asyncio.run(run_multiple_batches(num_batches=21, max_pages_per_batch=2))
+    asyncio.run(run_scrape_cycle())

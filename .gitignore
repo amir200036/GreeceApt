@@ -13,11 +13,11 @@ venv/
 .venv/
 env/
 
-# Data files (scraped data, databases, credentials)
+# Data files (scraped data, databases, credentials, logs)
+data/*.db
+data/*.json
+data/*.log
 data/cookies.json
-data/listings.json
-data/listings.db
-data/db_updated.db
 data/state.json
 
 # Keep the data directory itself

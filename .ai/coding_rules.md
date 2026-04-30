@@ -4,7 +4,7 @@
 
 - Python 3.11+. Use `X | Y` unions, `list[T]` / `dict[K,V]` generics — no `from typing import Optional/Dict/List`.
 - `from __future__ import annotations` is used in pipeline files — keep it there.
-- Private module-level constants use a leading underscore (e.g., `_SCHEMA`, `_build_score_update_sql`).
+- Private module-level constants use a leading underscore (e.g., `_FLOOR_TEXT_MAP`, `_ORDINAL_RE`).
 - No docstrings on trivial functions. Add docstrings only when the logic is non-obvious.
 - Add comments on SQL blocks and scoring formulas — these are complex and need explanation.
 - No backwards-compatibility shims (renaming unused vars, re-exporting removed names, etc.).
@@ -13,72 +13,66 @@
 
 ## Database Rules
 
-### listings.db (raw store)
-- Schema lives in `db/core.py` — `create_tables()` creates it with `CREATE TABLE IF NOT EXISTS`.
+### ingested_listings.db (raw store)
+- Schema lives in `db_helpers/core.py` — `create_tables()` creates it with `CREATE TABLE IF NOT EXISTS`.
 - Inserts use `INSERT OR REPLACE` keyed on `url TEXT UNIQUE` (normalized URL).
 - `normalize_xe_item()` maps raw scraper dicts to DB row format — all field mapping happens here.
-- Never skip url normalization. Call `normalize_listing_url()` from `helpers.py` on every URL before insert.
+- Never skip URL normalization. Call `normalize_listing_url()` from `utils/helpers.py` on every URL before insert.
 - `raw_json` column stores the full original dict as JSON — preserve it for debugging.
 
-### db_updated.db (scored output)
-- Built fresh every run (`dst_db.unlink()` first) — never accumulate or merge.
+### updated_listings.db (pipeline working DB)
+- Built fresh every run (`UPDATED_DB.unlink()` first in `copy_ingested_to_updated`) — never accumulate.
 - Source DB is opened read-only (`uri=True`, `mode=ro`).
+- All columns are stored as TEXT — use explicit `CAST(col AS REAL)` / `CAST(col AS INTEGER)` in queries.
 - Column presence is always checked via `PRAGMA table_info` before use — no assumptions.
-- Only insert rows with status: `deal`, `needs_review`, `no_market`, `unknown_neighborhood`.
-- Never insert `not_deal` or `broken_candidate` — they are counted only.
+- Filtered rows go to `removed_listings` table with `removal_reason` and `layer_origin` columns.
+
+### final_deals.db (scored output)
+- Always deleted and recreated by `scoring_conductor.py` via `reset_final_db()`.
+- Contains `deals` table (one row per scored listing) and `neighborhoods` table.
 
 ---
 
 ## Neighborhood / Location Rules
 
-- **neighborhood**: canonical name only. No prefixes (Ano/Kato/Nea/Neo), no junk.
-- **area**: stores ONLY valid modifiers: `Ano`, `Kato`, `Nea`, `Neo`, `Palaio`.
+- **neighborhood**: canonical name only — no prefixes, no junk.
+- `resolve_neighborhood()` in `utils/helpers.py` handles compound names split across API fields (e.g., municipality="Nea", area="Smyrni" → "Nea Smyrni").
 - **Agia / Agios / Agioi are NOT prefixes** — never strip them from the neighborhood name.
-- All spelling variants must be mapped through `NEIGHBORHOOD_CANONICAL` in `ingest.py`.
-- Canonical names in `ingest.py` must exactly match the keys in `NEIGHBORHOOD_SCORES` in `create_updated_db.py`.
-- When adding a new neighborhood: add it to both maps in both files simultaneously.
+- All neighborhood tier mappings live in `NEIGHBORHOOD_CANONICAL` in `scoring/scoring_algorithm.py`.
 
 ---
 
 ## Scraper Rules
 
-- Bot verification check (`is_verification_page`) must be called before any user-prompt about timeouts.
-- Never change `wait_until="domcontentloaded"` back to `"networkidle"` for listing detail pages — this was the key speedup.
-- Concurrent detail fetches are limited to `DETAIL_CONCURRENCY = 5` via `asyncio.Semaphore` — do not increase.
-- Group URL resolution uses a separate semaphore of 3 — keep it lower than detail concurrency.
-- `photos_count` should fall back to `len(photo_urls)` if the gallery CSS selector fails.
-- Pagination state (`state.json`) must be written after each page — enables resumable runs.
+- Never change the `impersonate="chrome124"` setting on the curl-cffi session.
+- Concurrent detail fetches are limited to 3 via `asyncio.Semaphore` — do not increase.
+- On 403/405/429: refresh cookies and back off. On 405: use a 45s×attempt backoff (server flagged the session).
+- `photos_count` falls back to `len(photo_urls)` if the API field is missing.
 - URL deduplication is done by normalized path (query params stripped by `normalize_listing_url`).
 
 ---
 
 ## Scoring Rules
 
-- Weights must always sum to 1.00:
-  - `W_HOOD=0.36`, `W_DISCOUNT=0.32`, `W_FLOOR=0.19`, `W_SIZE=0.13`
-- Renovation bonus is flat (not weighted): +6 for reno ≥ 2020, +3 for reno ≥ 2010.
-- Area modifier (Ano/Kato) is flat (not weighted): Ano=+2, Kato=−2.
-- `year_built`, `listing_age`, and `energy_class` are intentionally excluded from scoring.
-- `_build_score_update_sql()` builds the entire UPDATE SQL — do not inline SQL into `create_updated_db()`.
-- All score components use SQL `CASE` expressions with `NULL`-safe fallback to a neutral value (typically 50).
+- Weights must sum to 1.00: `W_PRICE=0.45`, `W_HOOD=0.20`, `W_VISUAL=0.20`, `W_STRUCT=0.15`.
+- `_VISUAL_FALLBACK = 5.0` is used when a listing has no visual_score (not yet audited).
+- `visual_quality` is read directly from the `visual_score` column of the row — no separate DB lookup.
+- All score components return 0.0–1.0; multiply by 100 at the end.
 
 ---
 
 ## Market Computation Rules
 
-- Market median uses IQR trimming (`IQR_K=2`, `IQR_MIN_N=8` minimum samples).
-- Listings below `BROKEN_FACTOR × median_raw` (0.70) are excluded from the clean set.
-- Listings below `SUSPECT_FACTOR × median_raw` (0.50) are marked `broken_candidate`.
-- `DEAL_MAX_RATIO = 0.80` — listings must be ≤ 80% of market_psqm to qualify as a deal.
-- Only listings with `used_for_market=1` contributed to the market benchmark.
-- Do not change `RECENT_DAYS=180` or `MIN_PHOTOS=5` without understanding the knock-on effect on sample sizes per neighborhood.
+- Uses 10%-trimmed mean (`TRIM_PCT = 0.10`) — top and bottom 10% of PSQM values per neighborhood are excluded.
+- Floor multipliers normalize listings to a "1st-floor equivalent" before computing the baseline.
+- Neighborhoods with no listings are simply absent from the baselines dict — listings in those hoods are skipped in scoring.
 
 ---
 
 ## What Not to Do
 
-- Do not add error handling for internal invariants (e.g., don't `try/except` around `NEIGHBORHOOD_SCORES[hood]` — if a key is missing it should crash loudly).
+- Do not add error handling for internal invariants — if a key is missing it should crash loudly.
 - Do not add features not requested — no extra columns, no new export formats, no optional flags.
 - Do not create new files for one-time logic — extend an existing module.
 - Do not remove `raw_json` from the listings table — it is the audit trail.
-- Do not touch `areas_external.py` functions from the main pipeline — they are manual-use utilities only.
+- Do not call sqlite3 directly from pipeline layer files — use `db_conductor.py` instead.

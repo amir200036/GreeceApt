@@ -6,7 +6,6 @@
 ┌─────────────────────────────────────────────────────────┐
 │                      USER / BROWSER                     │
 │  - Solves CAPTCHA manually when prompted                │
-│  - Confirms verification is complete via terminal       │
 └────────────────────────┬────────────────────────────────┘
                          │ (interactive, one-time)
                          ▼
@@ -19,34 +18,72 @@
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │              scrape_xe.py                               │
-│  1. Load cookies, build XE.gr search URL                │
-│  2. Paginate search results (scroll + Next button)      │
-│  3. Collect listing URLs (dedup by normalized path)     │
-│  4. Fetch listing detail pages (async, max 5 concurrent)│
-│  5. Parse HTML → structured listing dicts               │
-│  6. Merge with existing listings.json (dedup by url)    │
-│  Output: data/listings.json, data/state.json            │
+│  1. Load cookies, build curl-cffi impersonated session  │
+│  2. Paginate XE.gr map search (up to 50 pages)         │
+│  3. Collect listing IDs via map_search API              │
+│  4. Fetch detail per ID via single_result API           │
+│     (async, max 3 concurrent, 5–10s random delay)       │
+│  5. Resolve ad groups (cheapest price + most photos)    │
+│  6. Write to scraper_listings.json (dedup by url)       │
+│  Output: data/scraper_listings.json                     │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
-│              ingest.py                                  │
-│  1. Load listings.json                                  │
-│  2. Canonicalize neighborhoods (147-entry map)          │
-│  3. Split Ano/Kato/Nea/Neo prefix → area column         │
-│  4. INSERT OR REPLACE into listings.db                  │
-│  Output: data/listings.db                               │
+│              pipeline/ingest.py                         │
+│  1. Load scraper_listings.json                          │
+│  2. Normalize URLs, resolve neighborhoods               │
+│  3. INSERT OR REPLACE into ingested_listings.db         │
+│  Output: data/ingested_listings.db                      │
 └────────────────────────┬────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────┐
-│              db/create_updated_db.py                       │
-│  1. Read listings.db (read-only)                        │
-│  2. Compute IQR-trimmed market median per neighborhood  │
-│  3. Classify each listing (deal/not_deal/needs_review/…)│
-│  4. Insert qualifying rows into db_updated.db           │
-│  5. Run SQL UPDATE to compute final_score               │
-│  Output: data/db_updated.db                             │
+│              ai_conductor.py — Layer 0                  │
+│  1. Copy ingested_listings.db → updated_listings.db     │
+│  2. Remove: missing neighborhood                        │
+│  3. Remove: publication date > 180 days old             │
+│  4. Remove: fewer than 2 photos                         │
+│  Removed rows → removed_listings table                  │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              ai_conductor.py — Layer 1                  │
+│  (Moondream2 via Ollama, ThreadPoolExecutor)            │
+│  1. Download all images per listing (8 workers)         │
+│  2. Resize to 384×384 LANCZOS → temp JPEG               │
+│  3. Run Moondream2: "Briefly describe this room…"       │
+│  4. Parse description → interior/exterior + score 1–10  │
+│  5. visual_score = avg of top-5 interior scores         │
+│  6. Write visual_score, aesthetic_grade to DB           │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              ai_conductor.py — Layer 2                  │
+│  1. Remove listings with aesthetic_grade < 3.0          │
+│  2. Remove all listings in neighborhoods with < 10 left │
+│  Removed rows → removed_listings table                  │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              scoring_conductor.py — Layer 3             │
+│  market_analytics.py:                                   │
+│  1. For each neighborhood: collect (price/area)*floor_mult│
+│  2. 10%-trimmed mean → neighborhood PSQM baseline        │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│              scoring_conductor.py — Final Ranking       │
+│  scoring_algorithm.py:                                  │
+│  score = 45% price_arbitrage                            │
+│        + 20% location_tier                              │
+│        + 20% visual_quality                             │
+│        + 15% structural_index                           │
+│  Output: data/final_deals.db  (deals + neighborhoods)   │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -55,39 +92,44 @@
 ## Module Relationships
 
 ```
+main.py
+  └── ai_agent/ai_conductor.py
+        ├── ai_agent/layer_0_cleaner.py   → db_helpers/db_conductor.py
+        ├── ai_agent/layer_1_quality_audit.py  (Ollama HTTP, Pillow)
+        └── ai_agent/layer_2_aesthetic_filter.py → db_helpers/db_conductor.py
+
+  └── scoring/scoring_conductor.py
+        ├── scoring/market_analytics.py
+        ├── scoring/scoring_algorithm.py
+        └── db_helpers/db_conductor.py
+
 scrape_xe.py
-  └── uses: cookie_manager.py (load_cookies)
-  └── uses: url_builder.py (build_xe_url)
-  └── uses: helpers.py (normalize_listing_url)
+  ├── cookies/cookie_manager.py   (load_cookies)
+  ├── utils/url_builder.py        (build_xe_url, ATHENS_CENTER_ID)
+  └── utils/helpers.py            (normalize_listing_url, resolve_neighborhood)
 
-ingest.py
-  └── uses: db/core.py (create_tables, insert_listings)
-  └── uses: helpers.py (extract_area_prefix, strip_area_prefix)
+pipeline/ingest.py
+  └── db_helpers/core.py          (insert_listings)
 
-db/create_updated_db.py
-  └── standalone — reads listings.db via sqlite3 directly
-
-db/core.py
-  └── uses: helpers.py (normalize_listing_url)
-
+db_helpers/core.py
+  └── utils/helpers.py            (normalize_listing_url)
 ```
 
 ---
 
 ## Database Schema
 
-### `data/listings.db` — Raw Store
+### `data/ingested_listings.db` — Raw Store
 
 ```sql
 CREATE TABLE listings (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    url              TEXT UNIQUE,          -- normalized, dedup key
+    url              TEXT UNIQUE,
     headline         TEXT,
     price_eur        REAL,
     price_per_sqm    REAL,
     area_sqm         REAL,
-    neighborhood     TEXT,                 -- canonical name (post-ingest)
-    area             TEXT,                 -- Ano/Kato/Nea/Neo only (or NULL)
+    neighborhood     TEXT,
     address_raw      TEXT,
     bedrooms         INTEGER,
     bathrooms        INTEGER,
@@ -96,84 +138,50 @@ CREATE TABLE listings (
     renovation_year  INTEGER,
     energy_class     TEXT,
     photos_count     INTEGER,
-    photo_urls_json  TEXT,                 -- JSON array of photo URLs
-    publication_date TEXT,                 -- ISO date (YYYY-MM-DD)
-    scraped_at       TEXT,                 -- ISO datetime
-    raw_json         TEXT,                 -- full original dict (audit trail)
-    updated_at       TEXT,                 -- last upsert timestamp
-    neighborhood_score INTEGER
+    photo_urls_json  TEXT,
+    publication_date TEXT,
+    scraped_at       TEXT,
+    raw_json         TEXT,
+    updated_at       TEXT,
+    neighborhood_score INTEGER,
+    visual_score     REAL,
+    aesthetic_grade  REAL
 );
 ```
 
-### `data/db_updated.db` — Scored Output
+### `data/updated_listings.db` — Pipeline Working DB
 
-All columns from `listings.db` plus:
+Same columns as ingested_listings.db (all stored as TEXT — cast explicitly in queries), plus:
 
 ```sql
-neighborhood_canon        TEXT,   -- same as neighborhood (post-canon)
-neighborhood_mod          TEXT,   -- Ano/Kato/Nea/Neo/Palaio (scoring modifier)
-listing_age_days          INTEGER,
-listing_psqm              REAL,   -- price_eur / area_sqm
-neighborhood_market_psqm  REAL,   -- IQR-trimmed median for that neighborhood
-final_score               REAL,   -- 0–100 investment score
-status                    TEXT,   -- deal / needs_review / no_market / unknown_neighborhood
-used_for_market           INTEGER -- 1 if contributed to market median
+layer_1_processed  INTEGER DEFAULT 0,
+visual_score       REAL,
+aesthetic_grade    REAL,
+layer_1_features   TEXT
 ```
 
-Also contains:
+Also contains `removed_listings` table with all source columns + `removal_reason TEXT, layer_origin TEXT`.
+
+### `data/final_deals.db` — Scored Output
+
 ```sql
-CREATE TABLE areas_external (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    neighborhood       TEXT UNIQUE,
-    neighborhood_score INTEGER
+CREATE TABLE deals (
+    score       REAL,
+    hood        TEXT,
+    price       INTEGER,
+    area        INTEGER,
+    market_diff TEXT,
+    floor       TEXT,
+    visual      REAL,
+    url         TEXT
 );
-```
 
----
-
-## Data Flow Detail
-
-### Scraper Detail Flow
-
-```
-build_xe_url()
-    → Playwright navigates to search results (domcontentloaded)
-    → Scroll to bottom (600ms interval) to trigger lazy-loaded ads
-    → Collect all <a> href listing URLs from the page
-    → Check for "Next" button → navigate to next page
-    → Save state.json (last_page)
-    → For each new URL (not in existing listings.json):
-        → asyncio.Semaphore(5) → open detail page (domcontentloaded)
-        → Wait for CSS selectors: characteristics, basic-info, statistics
-        → BeautifulSoup parse → extract all fields
-        → If group listing: resolve group → pick lowest price variant
-    → Merge results with existing listings.json (keyed by normalized url)
-```
-
-### Scoring Flow
-
-```
-For each neighborhood in TOP_NEIGHBORHOODS:
-    1. Pull all recent (180d), valid (≥5 photos) listings
-    2. Compute psqm = price_eur / area_sqm
-    3. Sort → IQR trim (K=2, skip if <8 samples)
-    4. Remove listings below 70% of raw median
-    5. market_psqm = median(clean set)
-
-For each candidate listing:
-    listing_psqm = price_eur / area_sqm
-    if listing_psqm < 50% of median → broken_candidate (skip)
-    if listing_psqm < 70% of median → needs_review (insert)
-    if listing_psqm ≤ 80% of market_psqm → deal (insert)
-    else → not_deal (skip)
-
-SQL UPDATE sets final_score:
-    0.36 × neighborhood_score      (0–100, from NEIGHBORHOOD_SCORES dict)
-  + 0.32 × discount_score         (0–100, how far below market psqm)
-  + 0.19 × floor_score            (basement=20 → 5th+=98)
-  + 0.13 × size_score             (25–55sqm=100, sweet spot)
-  + mod_adj                       (Ano=+2, Kato=−2, flat)
-  + renovation_bonus              (≥2020=+6, ≥2010=+3, flat)
+CREATE TABLE neighborhoods (
+    name          TEXT PRIMARY KEY,
+    listing_count INTEGER,
+    median_psqm   REAL,
+    tier          TEXT
+);
 ```
 
 ---
@@ -182,11 +190,11 @@ SQL UPDATE sets final_score:
 
 | Decision | Reason |
 |----------|--------|
-| Two separate DBs (raw + scored) | Audit trail: raw data is never destroyed by the scoring run |
+| Three separate DBs | ingested = source of truth; updated = filtered working copy rebuilt each run; final = output only |
 | `INSERT OR REPLACE` on url | Idempotent ingestion — re-running ingest is safe |
-| db_updated.db rebuilt from scratch each run | Scoring parameters change frequently; stale rows cause confusion |
-| `domcontentloaded` instead of `networkidle` | 3–5× faster scraping; XE.gr's dynamic content is not needed |
-| IQR trimming for market median | Prevents a few data errors from making a whole neighborhood look cheap |
-| Manual CAPTCHA, not automation | XE.gr bot detection is sophisticated; human solve is reliable |
-| Neighborhood canonicalization at ingest | Keeps scoring logic clean; scoring only sees canonical names |
-| Flat renovation/mod bonuses | Small adjustment that doesn't distort the weighted score |
+| updated_listings.db rebuilt from scratch each run | Layer 0 always starts clean; stale filtered rows don't accumulate |
+| All columns TEXT in updated_listings.db | Avoids type mismatch when copying from a typed source; queries use explicit CAST |
+| Moondream via Ollama (local) | No API costs, no rate limits, private data stays local |
+| Top-5 interior images for visual_score | Robust to exterior/floor-plan shots that sneak into listings |
+| 10%-trimmed mean for PSQM baseline | Removes extreme outliers without IQR complexity |
+| Floor multiplier in baseline computation | Normalizes all listings to "1st-floor equivalent" so ground-floor discounts don't distort the neighborhood average |

@@ -1,4 +1,4 @@
-"""Shared URL and neighborhood-prefix utilities used across the pipeline."""
+"""Shared URL and neighborhood utilities used across the pipeline."""
 
 from urllib.parse import urlsplit, urlunsplit
 
@@ -14,28 +14,32 @@ def normalize_listing_url(url: str | None) -> str | None:
         return None
 
 
-# Only these words are treated as geographic prefixes extracted into `area`.
-# NOTE: "Agia/Agios/Agioi" are NOT prefixes — they stay in neighborhood.
-AREA_PREFIXES = {"ano", "kato", "nea", "neo"}
+# Words that indicate a compound neighborhood name split across API fields.
+# Used only to recombine e.g. municipality="Nea", area="Smyrni" → "Nea Smyrni".
+_COMPOUND_PREFIXES = frozenset({"ano", "kato", "nea", "neo", "palaio"})
 
 
-def extract_area_prefix(name: str | None) -> str | None:
-    """Return 'Ano'/'Kato'/'Nea'/'Neo' if the name starts with one of them."""
-    if not name:
+def resolve_neighborhood(
+    municipality: str | None, area_raw: str | None
+) -> str | None:
+    """
+    Return the full neighborhood name, combining split API fields when needed.
+    Examples:
+      ("Nea Smyrni", None)   → "Nea Smyrni"
+      ("Nea", "Smyrni")      → "Nea Smyrni"
+      ("Athens", "Pagkrati") → "Pagkrati"
+      ("Pagkrati", "Gouva")  → "Pagkrati"
+    """
+    mun = (municipality or "").strip() or None
+    ar = (area_raw or "").strip() or None
+    if not mun and not ar:
         return None
-    parts = name.strip().split()
-    if not parts:
-        return None
-    return parts[0].capitalize() if parts[0].lower() in AREA_PREFIXES else None
-
-
-def strip_area_prefix(name: str | None) -> str | None:
-    """If name starts with Ano/Kato/Nea/Neo, remove it and return the base name."""
-    if not name:
-        return None
-    parts = name.strip().split()
-    if not parts:
-        return None
-    if parts[0].lower() in AREA_PREFIXES and len(parts) >= 2:
-        return " ".join(parts[1:]).strip() or None
-    return name.strip() or None
+    if mun and mun.lower() == "athens":
+        return ar or None
+    if mun:
+        mun_parts = mun.split()
+        # API sometimes splits compound names: municipality="Nea", area="Smyrni"
+        if len(mun_parts) == 1 and mun_parts[0].lower() in _COMPOUND_PREFIXES and ar:
+            return mun + " " + ar
+        return mun
+    return ar
