@@ -69,6 +69,7 @@ Ollama (Layer 1): `ollama pull moondream` then `ollama serve`.
 ```bash
 python -m greeceapt.cookies.cookie_manager           # refresh cookies when missing or expired
 python -m greeceapt.main                             # full pipeline
+python -m greeceapt.main --score-only                # Stage 4 only → final_deals.db (after AI)
 
 # Individual stages (same order as ``main``)
 python -m greeceapt.scraper.run_all                  # scrape + merge only → data/listings.json

@@ -6,7 +6,7 @@ You are an expert Python developer working on **GreeceApt**: an autonomous pipel
 
 **Authoritative docs:** `.ai/project_context.md`, `.ai/coding_rules.md`, `.ai/architecture.md`.
 
-**End-to-end flow** (`python -m greeceapt.main`):
+**End-to-end flow** (`python -m greeceapt.main`; **`--score-only`** runs Stage 4 alone, same as `scoring_conductor`):
 
 1. **Scrape** — `greeceapt.scraper.run_all`: parallel subprocess scrapers → merge/dedupe → `data/listings.json`
 2. **Ingest** — `greeceapt.pipeline.ingest` + `db_helpers.core.insert_listings` → `data/ingested_listings.db`

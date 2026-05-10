@@ -1,58 +1,285 @@
 # GreeceApt — Architecture
 
-## Five-layer pipeline (conceptual → code)
+Pipeline map: **scrape → ingest → AI (layers 0–2) → score**. Entrypoint: `python -m greeceapt.main`. **`--score-only`** runs Stage 4 only (same as `greeceapt.scoring.scoring_conductor`); expects `data/updated_listings.db` from a prior AI run.
 
-| # | Layer | Responsibility | Primary code |
-|---|--------|----------------|--------------|
-| **1** | **Ingest** | Scraped JSON → **`ingested_listings.db`** (normalized URLs, floor names, types) | `pipeline/ingest.py`, `db_helpers/core.py` |
-| **2** | **Filter** | Drop **basements** (by normalized floor), listings with **≤2** photos, stale publication (**>180d**), missing neighborhood | `ai_agent/layer_0_cleaner.py` (copy ingested → `updated_listings.db` + filters) |
-| **3** | **Auditor (AI vision)** | Parallel image audit via **Ollama (Moondream)** → structured JSON → **`visual_score`** (1–10 rubric), interior-gated | `ai_agent/layer_1_quality_audit.py`, `ai_agent/ai_conductor.py`, `db_helpers/db_conductor.py` |
-| **4** | **Analyst (baseline)** | Per-neighborhood **floor-adjusted, trimmed-mean normalized PSQM** (`market_analytics`). Neighborhoods with **fewer than 10** qualifying listings **are omitted** from the baseline map — **no** tier-wide or municipality fallback for the price anchor | `scoring/market_analytics.py`, `scoring/scoring_conductor.py` |
-| **5** | **Ranker** | Weighted sum of price, location tier, visual, structure → **`final_deals.db`** | `scoring/scoring_algorithm.py` (`rank_deals`), `db_conductor` |
+**DDL:** tables are defined in `db_helpers/core.py` and `db_helpers/db_conductor.py`. The SQL blocks below are a **readable snapshot**; if they disagree with code, trust the repo.
 
-**Layer 2 (aesthetic gate)** after the auditor: `layer_2_aesthetic_filter.py` removes weak visuals / thin neighborhoods before ranking — still part of the “quality path” before baselines consume the surviving set.
+## Stages
 
-**Filter contract:** Layer 0 currently enforces neighborhood, **≥3** photos, and **>180d** staleness. **Basement exclusion** is a required part of this layer’s contract: implement using normalized `floor` / numeric level (consistent with ingest rules and `xe_parse` floor semantics) if not already present in SQL.
+| Stage | Runs | Primary artifact |
+|-------|------|------------------|
+| **1** | `greeceapt.scraper.run_all` | `data/listings.json` (+ per-site JSON, merge sidecars) |
+| **2** | `greeceapt.pipeline.ingest` → `db_helpers.core.insert_listings` | `data/ingested_listings.db` |
+| **3** | `greeceapt.ai_agent.ai_conductor.run` | `data/updated_listings.db` |
+| **4** | `greeceapt.scoring.scoring_conductor.run` | `data/final_deals.db` |
 
-## End-to-end data flow
+Ordered steps: cookies (optional) → scrape → ingest → Layer 0 (copy + SQL filters) → Layer 1 (vision) → Layer 2 (gates) → baselines + `rank_deals`.
 
-1. **Cookies** — `cookies/cookie_manager.py` → `data/cookies.json`
-2. **Scrape** — `scraper/run_all.py`: XE + Spitogatos → `data/listings.json` (+ per-site JSON, merge metadata)
-3. **Ingest** — `listings.json` → **`ingested_listings.db`**
-4. **Filter (Layer 0)** — copy → **`updated_listings.db`**, apply metadata rules
-5. **Auditor (Layer 1)** — Moondream batch/parallel image processing → columns on `updated_listings.db`
-6. **Gate (Layer 2)** — visual + neighborhood density rules
-7. **Analyst + Ranker** — baselines from `updated_listings` / stats tables → **`final_deals.db`**
+## Pipeline diagrams
 
-**Main orchestrator:** `greeceapt/main.py` runs stages in order.
+### Overview (Mermaid)
 
-## Database schema relationships
+```mermaid
+flowchart TB
+  subgraph prep["Prep (as needed)"]
+    CM["cookie_manager → data/cookies.json"]
+  end
 
-- **`ingested_listings.db` — `listings`:** durable ingested rows; unique key on **normalized `url`**; retains `raw_json`.
-- **`updated_listings.db` — `listings`:** same logical listing rows plus **layer columns** (`visual_score`, flags, audit timestamps). Rebuilt from ingested each run at Layer 0 so filters do not stack incorrectly.
-- **`final_deals.db`:**
-  - **`deals`:** ranked output rows (scores, components, listing identifiers / URLs as defined in `create_final_schema`).
-  - **`neighborhoods` (or equivalent stats table):** aggregated **neighborhood_stats** (median PSQM, counts, tier anchors) consumed by the ranker and UI/analytics.
+  subgraph s1["Stage 1 — Scrape"]
+    RA["scraper/run_all\nXE + Spitogatos, merge/dedupe"]
+    LJ[("data/listings.json")]
+    RA --> LJ
+  end
 
-**Relationship (conceptual):** each **deal** in `final_deals.db` refers to one surviving listing identity (via `listing_id` / `url`) and joins logically to **`neighborhoods`** snapshot rows on **canonical neighborhood** for display (counts + optional baseline PSQM). **Tier** feeds the location score only; thin neighborhoods do not inherit a synthetic PSQM baseline.
+  subgraph s2["Stage 2 — Ingest"]
+    ING["pipeline/ingest + insert_listings"]
+    IDB[("ingested_listings.db")]
+    LJ --> ING --> IDB
+  end
 
-**Source of truth for `CREATE TABLE`:** `db_helpers/core.py` (ingested), `db_conductor.setup_layer0_tables` / `_ensure_layer1_columns` (updated), `db_conductor.create_final_schema` (final). Do not duplicate full DDL in this doc.
+  subgraph s3["Stage 3 — AI"]
+    L0["Layer 0 — SQL filter\ncopy → updated"]
+    L1["Layer 1 — Moondream + JSON score"]
+    L2["Layer 2 — aesthetic + thin hood"]
+    UDB[("updated_listings.db")]
+    IDB --> L0 --> UDB
+    UDB --> L1 --> L2
+    L1 -.->|audit columns| UDB
+    L2 -.->|prune rows| UDB
+  end
 
-## Performance — AI throughput
+  subgraph s4["Stage 4 — Score"]
+    SC["scoring_conductor\nmarket_analytics + rank_deals"]
+    FDB[("final_deals.db")]
+    UDB --> SC --> FDB
+  end
 
-- **Batch / parallel auditor:** Layer 1 should **batch work** (concurrent downloads + bounded concurrency to Ollama) to maximize throughput without saturating VRAM or tripping rate limits — tune semaphores and worker pools in `layer_1_quality_audit.py` / conductor, not one HTTP call per process fork.
+  CM -.-> RA
+```
 
-## Imports (high level)
+### File-level flow (ASCII)
 
-- `main` → `run_all`, ingest, `ai_conductor`, `scoring_conductor`
-- AI + **`scoring_conductor`** → **`db_helpers/db_conductor`** for connections/writes.
-- **`rank_deals`** (pure scoring) consumes `sqlite3.Row` objects **supplied by** `db_conductor` — it must not open its own DB files.
+Stage 1 uses **two subprocesses** (`run_all.py`), then merge.
 
-## Design choices
+```
+┌─────────────────────────────────────────────────────────┐
+│  USER / BROWSER                                         │
+│  CAPTCHA / bootstrap when XE flow requires it            │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  cookies/cookie_manager.py → data/cookies.json           │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  scraper/run_all.py                                     │
+│  • python -m greeceapt.scraper.scrape_xe                │
+│    → scraper/xe/* (cookies, curl-cffi, APIs)            │
+│    → data/xe_listings.json                              │
+│  • python -m greeceapt.scraper.scrape_spitogatos        │
+│    → data/spitogatos_listings.json                      │
+│  • Merge + Quad-Lock dedupe (pHash + metadata)          │
+│  → data/listings.json (+ deleted/stale sidecars)        │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  pipeline/ingest.py + db_helpers.core.insert_listings   │
+│  normalize_listing_url, resolve_neighborhood, upsert     │
+│  → data/ingested_listings.db                            │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  ai_conductor + layer_0_cleaner                         │
+│  Copy ingested → updated; drop: no hood, age > 180d,    │
+│  ≤2 photo URLs (need ≥3). Rows → removed_listings.      │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  ai_conductor + layer_1_quality_audit (Ollama)          │
+│  Download → 384×384 JPEG → Moondream describe →         │
+│  OLLAMA_SCORE_MODEL JSON (score, view_type, …)          │
+│  visual_score = top-5 interior mean; UPDATE listings.   │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  ai_conductor + layer_2_aesthetic_filter                │
+│  Drop visual_score < 3.0 or NULL; drop thin hoods       │
+│  (< 10 listings). Rows → removed_listings.             │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  scoring_conductor + market_analytics                   │
+│  Hood PSQM baselines; <10 listings → no baseline row    │
+└────────────────────────┬────────────────────────────────┘
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  scoring_algorithm.rank_deals                           │
+│  45% price + 20% tier + 20% visual + 15% structure      │
+│  (renormalize if price baseline missing)                │
+│  → data/final_deals.db (deals + neighborhoods)          │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Stage 3 — layers 0–2
+
+Order is fixed in `ai_conductor.run()`.
+
+| Layer | Role | Code |
+|-------|------|------|
+| **0** | Copy ingested → `updated_listings.db`; remove missing neighborhood, **>180d** age, **≤2** photos (needs **≥3**). Basement drop belongs here when implemented (`floor` / `xe_parse`). | `ai_agent/layer_0_cleaner.py` |
+| **1** | Moondream one-line description + **`OLLAMA_SCORE_MODEL`** JSON → `visual_score`, `layer_1_features`; interior-like views only for aggregation. | `ai_agent/layer_1_quality_audit.py`, `db_conductor` |
+| **2** | `visual_score` threshold + purge neighborhoods with **<10** survivors (thin-hood gate). | `ai_agent/layer_2_aesthetic_filter.py` |
+
+## Stage 4 — scoring
+
+| Piece | Role | Code |
+|-------|------|------|
+| **Baselines** | Per-hood floor-adjusted trimmed-mean normalized PSQM; hoods with **<10** samples → **no** baseline (no tier/muni substitute for price anchor). | `scoring/market_analytics.py`, `scoring_conductor.py` |
+| **Rank** | Blend weights; omit price leg + renormalize when baseline missing. | `scoring/scoring_algorithm.rank_deals` |
+
+`rank_deals` is **pure**: receives `sqlite3.Row` from the conductor via `db_conductor`; it must not open DB connections.
+
+## Databases
+
+### Relationships (Mermaid)
+
+```mermaid
+flowchart LR
+  subgraph ing["ingested_listings.db"]
+    IL["listings\nurl, raw_json"]
+  end
+
+  subgraph upd["updated_listings.db"]
+    UL["listings + layer cols"]
+    RM["removed_listings"]
+  end
+
+  subgraph fin["final_deals.db"]
+    FD["deals"]
+    NS["neighborhoods"]
+  end
+
+  IL -->|Layer 0 copy + filters| UL
+  UL -->|Layer 0–2| RM
+  UL -->|Stage 4 read| FD
+  NS -->|hood stats| FD
+```
+
+### Roles
+
+- **`ingested_listings.db`:** durable listings; upsert on normalized **`url`**; `raw_json` retained.
+- **`updated_listings.db`:** rebuilt from ingested each Layer 0 run; adds `layer_1_processed`, `layer_1_features`, Layer 1 **`visual_score`**; **`removed_listings`** with `removal_reason`, `layer_origin`.
+- **`final_deals.db`:** **`deals`** (ranked rows); **`neighborhoods`** (counts, median PSQM, tier) for display and logic.
+
+Deals reference surviving listings by identity (`url` / id as written by scoring). Tier drives location score; thin hoods do not get a synthetic PSQM baseline.
+
+**DDL source:** `core.create_tables` (ingested), `db_conductor.setup_layer0_tables` / `_ensure_layer1_columns` / `_ensure_removed_table` (updated), `db_conductor.create_final_schema` (final).
+
+### SQL snapshot — `ingested_listings.db`
+
+From `db_helpers/core.create_tables` (migrations may add columns in the same module).
+
+```sql
+CREATE TABLE IF NOT EXISTS listings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT UNIQUE,
+    title TEXT,
+    price_eur REAL,
+    price_per_sqm REAL,
+    area_sqm REAL,
+    municipality TEXT,
+    neighborhood TEXT,
+    address_raw TEXT,
+    bedrooms INTEGER,
+    bathrooms INTEGER,
+    floor INTEGER,
+    year_built INTEGER,
+    renovation_year INTEGER,
+    energy_class TEXT,
+    heating_type TEXT,
+    photos_count INTEGER,
+    photo_urls_json TEXT,
+    publication_date TEXT,
+    scraped_at TEXT,
+    raw_json TEXT,
+    updated_at TEXT,
+    neighborhood_score INTEGER,
+    visual_score REAL,
+    source TEXT
+);
+
+CREATE TABLE IF NOT EXISTS neighborhoods (
+    name          TEXT PRIMARY KEY,
+    listing_count INTEGER NOT NULL DEFAULT 0,
+    first_seen    TEXT,
+    last_seen     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS price_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    listing_id INTEGER NOT NULL,
+    old_price_eur REAL,
+    new_price_eur REAL,
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY (listing_id) REFERENCES listings(id)
+);
+```
+
+### SQL snapshot — `final_deals.db`
+
+From `db_conductor.create_final_schema`.
+
+```sql
+CREATE TABLE deals (
+    score       REAL,
+    hood        TEXT,
+    price       INTEGER,
+    area        INTEGER,
+    market_diff TEXT,
+    floor       TEXT,
+    visual      REAL,
+    url         TEXT
+);
+
+CREATE TABLE neighborhoods (
+    name          TEXT PRIMARY KEY,
+    listing_count INTEGER,
+    median_psqm   REAL,
+    tier          TEXT
+);
+```
+
+## Code layout
+
+```
+greeceapt/main.py
+├── scraper/run_all.py
+│   ├── scraper/scrape_xe.py          → scraper/xe/* (run_scrape_cycle)
+│   ├── scraper/scrape_spitogatos.py
+│   └── scraper/util.py               merge, dedupe, stale handling
+├── pipeline/ingest.py
+│   └── db_helpers/core.py            insert_listings, ingest schema
+├── ai_agent/ai_conductor.py
+│   ├── ai_agent/layer_0_cleaner.py       → db_helpers/db_conductor.py
+│   ├── ai_agent/layer_1_quality_audit.py (Ollama, Pillow)
+│   └── ai_agent/layer_2_aesthetic_filter.py → db_helpers/db_conductor.py
+└── scoring/scoring_conductor.py
+    ├── scoring/market_analytics.py
+    ├── scoring/scoring_algorithm.py  rank_deals (pure; no DB)
+    └── db_helpers/db_conductor.py
+
+db_helpers/core.py → db_helpers/util.py (normalize_listing_url, …)
+```
+
+## Engineering notes
+
+**Layer 1 throughput:** concurrent downloads + bounded Ollama concurrency (`layer_1_quality_audit.py`, `ai_conductor` env vars) — avoid “one HTTP call per fork” patterns.
+
+**DB access:** scraper / AI / scoring conductors use **`db_conductor`** (or `core` for ingest); **`rank_deals`** must not open SQLite itself.
 
 | Topic | Choice |
 |-------|--------|
-| Three DBs | Ingested = durable input; updated = mutable scratch per run; final = regenerated output |
-| Idempotent ingest | Upsert on normalized `url` |
-| Ollama | Local Moondream — structured JSON protocol (see coding rules) |
-| Baselines | Trimmed mean PSQM; floor-adjusted; **min sample 10 per hood** — excluded hoods have no price anchor (weights renormalized in `rank_deals`) |
+| Three DBs | Ingested = durable input; updated = per-run scratch; final = regenerated output |
+| Ingest | Upsert on normalized `url` |
+| Vision | Moondream + JSON scoring model (see `.ai/coding_rules.md`) |
+| Baselines | Trimmed mean PSQM, floor-adjusted, **min 10 listings per hood**; missing baseline → price leg omitted, weights renormalized in `rank_deals` |
