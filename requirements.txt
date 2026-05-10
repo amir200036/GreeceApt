@@ -1,4 +1,6 @@
 Pillow
+imagehash
 requests
+httpx
 curl-cffi
 playwright

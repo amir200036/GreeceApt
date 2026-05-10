@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -13,6 +14,12 @@ venv/
 .venv/
 env/
 
+# Local Obscura CDP binary (not part of the Python package)
+/obscura
+
+# Accidental scraper output under src/ (canonical path is repo-root data/)
+src/data/
+
 # Data files (scraped data, databases, credentials, logs)
 data/*.db
 data/*.json
@@ -22,6 +29,9 @@ data/state.json
 
 # Keep the data directory itself
 !data/.gitkeep
+
+# Cursor / Claude Code local settings (do not commit)
+.claude/
 
 # IDE
 .vscode/

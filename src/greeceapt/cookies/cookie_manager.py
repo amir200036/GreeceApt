@@ -1,10 +1,12 @@
 import asyncio
 import json
-import time
 from pathlib import Path
 from typing import Any
 
 from playwright.async_api import Playwright, async_playwright
+
+from greeceapt.cookies import util as cookie_util
+from greeceapt.db_helpers.paths import COOKIES_JSON
 
 DEFAULT_START_URL = "https://www.xe.gr/en/property/results"
 
@@ -17,17 +19,17 @@ def load_cookies(cookies_path: Path) -> list[dict[str, Any]]:
     with cookies_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if isinstance(data, list):
-        cookies = data
-    elif isinstance(data, dict) and isinstance(data.get("cookies"), list):
-        cookies = data["cookies"]
-    else:
-        raise ValueError("cookies.json format not recognized (expected list or {'cookies': [...]}).")
+    try:
+        cookies = cookie_util.parse_cookie_json_root(data)
+    except ValueError as e:
+        raise ValueError(str(e)) from e
 
-    now = time.time()
-    expired = [c for c in cookies if isinstance(c.get("expires"), (int, float)) and c["expires"] > 0 and c["expires"] < now]
-    if expired:
-        print(f"[WARN] {len(expired)} of {len(cookies)} cookies are expired. Consider re-running cookie capture.")
+    n_exp = cookie_util.count_expired_cookies(cookies)
+    if n_exp:
+        print(
+            f"[WARN] {n_exp} of {len(cookies)} cookies are expired. "
+            "Consider re-running cookie capture."
+        )
 
     return cookies
 
@@ -95,17 +97,17 @@ async def ensure_cookies(
 
 
 async def run_cli() -> None:
-    project_root = Path(__file__).resolve().parents[3]
-    cookies_path = project_root / "data" / "cookies.json"
-
     async with async_playwright() as p:
         await ensure_cookies(
             playwright=p,
-            cookies_path=cookies_path,
+            cookies_path=COOKIES_JSON,
             start_url=DEFAULT_START_URL,
             auto_capture=True,
         )
 
 
 if __name__ == "__main__":
+    from greeceapt.logging_config import configure_root_logging
+
+    configure_root_logging()
     asyncio.run(run_cli())

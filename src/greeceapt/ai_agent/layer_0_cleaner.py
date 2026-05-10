@@ -3,32 +3,24 @@ Layer 0 — Metadata Filter (SQL only, no AI).
 
 Removes listings from updated_listings that fail any of three hard filters:
   - Missing neighborhood
-  - Fewer than 2 photos
+  - Fewer than 3 photos (2 or fewer URLs after parse)
   - Publication date > 180 days ago
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from datetime import date, datetime
+from datetime import date
 
+from greeceapt.ai_agent import util as ai_util
 from greeceapt.db_helpers import db_conductor
+from greeceapt.db_helpers.util import parse_photo_urls_json
 
 MAX_AGE_DAYS = 180
 LAYER_NAME   = "Layer 0"
 TODAY        = date.today()
 
 logger = logging.getLogger(__name__)
-
-
-def _parse_date(value) -> date | None:
-    if not value:
-        return None
-    try:
-        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date()
-    except ValueError:
-        return None
 
 
 def run() -> None:
@@ -53,7 +45,7 @@ def run() -> None:
                 continue
 
             # Filter 2: stale listing
-            d = _parse_date(pub_date) or _parse_date(scraped_at)
+            d = ai_util.parse_yyyy_mm_dd_prefix(pub_date) or ai_util.parse_yyyy_mm_dd_prefix(scraped_at)
             if d is not None:
                 age = (TODAY - d).days
                 if age > MAX_AGE_DAYS:
@@ -65,13 +57,10 @@ def run() -> None:
                     continue
 
             # Filter 3: too few photos
-            try:
-                urls = json.loads(photo_urls_json) if photo_urls_json else []
-            except (ValueError, TypeError):
-                urls = []
-            if len(urls) < 2:
+            urls = parse_photo_urls_json(photo_urls_json)
+            if len(urls) <= 2:
                 db_conductor.move_listing_to_removed(
-                    conn, row_id, LAYER_NAME, "Insufficient photos (<2)",
+                    conn, row_id, LAYER_NAME, "Insufficient photos (need at least 3)",
                 )
                 removed += 1
                 continue

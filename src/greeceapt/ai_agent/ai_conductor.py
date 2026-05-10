@@ -3,10 +3,15 @@ ai_conductor.py — Manages the AI filter pipeline.
 
 Full flow:
   Layer 0  Metadata Filter         (SQL only — neighborhood, age, photo count)
-  Layer 1  Moondream Visual Audit  (Ollama, concurrent download+resize, top-5 average, 1–10 scale)
+  Layer 1  Moondream Visual Audit  (Ollama, structured JSON per image, top-K interior scores, 1–10 scale)
   Layer 2  Aesthetic Quality Gate  (removes listings with visual_score < MIN_AESTHETIC_GRADE)
 
 Listings that fail Layer 0 are moved to removed_listings before any inference.
+
+Tuning (optional env):
+  ``AI_LAYER1_MAX_WORKERS`` — parallel listings (default 3).
+  ``AI_DOWNLOAD_WORKERS`` — parallel image downloads per listing (default 8).
+See ``layer_1_quality_audit`` for Ollama URL, per-listing Moondream concurrency, and image caps.
 """
 
 from __future__ import annotations
@@ -14,22 +19,26 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from greeceapt.db_helpers import paths as app_paths
+from greeceapt.logging_config import DEFAULT_FORMAT
+
 logger = logging.getLogger(__name__)
 
-_LOG_FORMAT = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-_DATA_DIR = Path(__file__).resolve().parents[3] / "data"
+_LOG_FORMAT = logging.Formatter(DEFAULT_FORMAT)
 
-LAYER1_MAX_WORKERS = 2
-DOWNLOAD_WORKERS   = 8
+# Log directory for Layer 1 file handler; tests monkeypatch ``ai_conductor.DATA_DIR``.
+DATA_DIR = app_paths.DATA_DIR
+
+# Listings processed in parallel (each listing still runs Moondream on its images with inner concurrency).
+LAYER1_MAX_WORKERS = max(1, int(os.environ.get("AI_LAYER1_MAX_WORKERS", "3")))
+DOWNLOAD_WORKERS = max(1, int(os.environ.get("AI_DOWNLOAD_WORKERS", "8")))
 
 
 # ── Layer 1 worker (runs inside a thread — no DB access) ─────────────────────
 
-def _process_listing(args: tuple[str, list[str]]) -> tuple[str, float | None]:
-    """Download + resize all images for a listing, run Moondream, return top-5 average (1–10 scale)."""
+def _process_listing(args: tuple[str, list[str]]) -> tuple[str, float | None, dict]:
+    """Download + resize images, run Moondream JSON audit, return (id, visual_score, features)."""
     from greeceapt.ai_agent.layer_1_quality_audit import analyze_listing, download_and_resize
 
     listing_id, urls = args
@@ -45,8 +54,8 @@ def _process_listing(args: tuple[str, list[str]]) -> tuple[str, float | None]:
     logger.info("Listing %s: %d URLs → %d downloaded", listing_id, len(urls), len(paths))
 
     try:
-        visual_score = analyze_listing(paths)
-        return listing_id, visual_score
+        visual_score, features = analyze_listing(paths)
+        return listing_id, visual_score, features
     finally:
         for p in paths:
             try:
@@ -64,7 +73,7 @@ def run_layer1(max_workers: int = LAYER1_MAX_WORKERS) -> None:
     """
     from greeceapt.db_helpers import db_conductor
 
-    _log_path = _DATA_DIR / "layer1.log"
+    _log_path = DATA_DIR / "layer1.log"
     _fh = logging.FileHandler(_log_path, encoding="utf-8")
     _fh.setFormatter(_LOG_FORMAT)
     logging.getLogger().addHandler(_fh)
@@ -88,14 +97,14 @@ def _run_layer1_impl(db_conductor, max_workers: int) -> None:
         conn.close()
 
     # ── Concurrent Moondream inference ────────────────────────────────────────
-    results: list[tuple[str, float | None]] = []
+    results: list[tuple[str, float | None, dict]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_process_listing, item): item[0] for item in work_items}
         for future in as_completed(futures):
             lid = futures[future]
             try:
-                lid, visual_score = future.result()
-                results.append((lid, visual_score))
+                lid, visual_score, features = future.result()
+                results.append((lid, visual_score, features))
                 score_str = f"{visual_score:.2f}" if visual_score is not None else "None"
                 logger.info("Layer 1: id=%-8s  visual_score=%s", lid, score_str)
             except Exception as exc:
@@ -105,12 +114,15 @@ def _run_layer1_impl(db_conductor, max_workers: int) -> None:
     if results:
         conn = db_conductor.connect_updated()
         try:
-            for lid, visual_score in results:
-                db_conductor.save_visual_audit_results(conn, lid, visual_score, {})
+            for lid, visual_score, features in results:
+                db_conductor.save_visual_audit_results(
+                    conn, lid, visual_score, features or {}, commit=False,
+                )
+            conn.commit()
         finally:
             conn.close()
 
-    scored  = sum(1 for _, s in results if s is not None)
+    scored  = sum(1 for _, s, _ in results if s is not None)
     skipped = len(work_items) - len(results)
     logger.info(
         "Layer 1 done. processed=%s  scored=%s  no_result=%s  worker_errors=%s",
@@ -136,4 +148,7 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    from greeceapt.logging_config import configure_root_logging
+
+    configure_root_logging()
     run()

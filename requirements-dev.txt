@@ -1,0 +1,2 @@
+# Tests only — omit for minimal scrape / main installs
+pytest

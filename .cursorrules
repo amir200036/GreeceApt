@@ -1,0 +1,83 @@
+# GreeceApt — Cursor rules (keep aligned with code + `.ai/*.md`)
+
+## Project context
+
+You are an expert Python developer working on **GreeceApt**: an autonomous pipeline that scrapes **XE.gr** and **Spitogatos**, merges listings, ingests to SQLite, runs metadata + vision gates, and ranks deals for **small Athens LTR apartments** in the project’s price band.
+
+**Authoritative docs:** `.ai/project_context.md`, `.ai/coding_rules.md`, `.ai/architecture.md`.
+
+**End-to-end flow** (`python -m greeceapt.main`):
+
+1. **Scrape** — `greeceapt.scraper.run_all`: parallel subprocess scrapers → merge/dedupe → `data/listings.json`
+2. **Ingest** — `greeceapt.pipeline.ingest` + `db_helpers.core.insert_listings` → `data/ingested_listings.db`
+3. **AI** — `greeceapt.ai_agent.ai_conductor`: Layer 0 → Layer 1 → Layer 2 on `data/updated_listings.db`
+4. **Score** — `greeceapt.scoring.scoring_conductor` → `data/final_deals.db`
+
+**Per-stage CLIs (same order):** `greeceapt.scraper.run_all`, `greeceapt.pipeline.ingest`, `greeceapt.ai_agent.ai_conductor`, `greeceapt.scoring.scoring_conductor`.
+
+---
+
+## DO
+
+### Architecture — database
+
+- Use **`db_helpers/db_conductor.py`** for pipeline DB connections, layer reads/writes, and scoring I/O.
+- Use **`db_helpers/core.py`** for ingest schema and **`insert_listings`** (bulk upsert from normalized dicts).
+- Use **`db_helpers/paths.py`** for `DATA_DIR` and `*_DB` paths — do not recompute project roots for DB files.
+- **`scoring_algorithm.rank_deals`** is pure: it receives **`sqlite3.Row`** objects already loaded by **`scoring_conductor`** via `db_conductor`; it must not open new DB connections.
+
+### Type safety
+
+- Python **3.11+**; type-hint public APIs; prefer `X | Y` and built-in generics.
+
+### Data ingestion
+
+- **URLs:** normalize with **`db_helpers.util.normalize_listing_url`** before upsert so duplicates collapse on canonical `url`.
+- **Floors:** keep numeric semantics consistent with scrapers / `xe_parse` (ground vs basement vs upper); ingest stores `floor` as provided by normalized listing dicts — extend normalization in **`db_helpers/core.normalize_listing`** or parser layer, not ad hoc in scoring.
+
+### AI vision — Layer 1 (`layer_1_quality_audit.py`)
+
+- **Two-step Ollama flow:** **Moondream** produces a one-sentence room description; **`OLLAMA_SCORE_MODEL`** (default **llama3**) returns **JSON only** with `score`, `is_renovated`, `view_type`.
+- **Interior gating:** use **`view_type`** from JSON — only **`interior`, `kitchen`, `bathroom`, `bedroom`, `living`, `dining`** contribute to the interior score pool; other views (e.g. balcony, exterior) are logged as skipped for aggregation. If llama3 fails, a keyword fallback fills scores (still produces `view_type`).
+- **Aggregate `visual_score`:** mean of **top 5** interior-like per-image scores (`TOP_K = 5`), scale **1.0–10.0** (stored/used consistently with scoring).
+- **Images:** resize to **`IMAGE_SIZE` (384×384)** JPEG before Ollama (`LAYER1_JPEG_QUALITY` env). Optional cap: **`LAYER1_MAX_IMAGES`**. Do not send full-resolution originals.
+- **Timeouts / bad JSON:** handle Ollama failures and malformed JSON without crashing the whole run (see existing logging + fallbacks).
+
+### Scoring & ranking (`scoring_algorithm.py` + `market_analytics.py`)
+
+- **Weights (sum to 1.0):** **45%** price vs neighborhood baseline (V-index), **20%** location tier, **20%** visual, **15%** structural composite (`W_PRICE`, `W_HOOD`, `W_VISUAL`, `W_STRUCT`).
+- **Baselines:** `compute_neighborhood_baselines` uses floor-adjusted normalized PSQM and a **minimum sample size (default 10)** per neighborhood. Hoods below the threshold **do not** get a baseline entry.
+- **No synthetic price fallback:** if a listing’s neighborhood has **no** baseline, the **price-arbitrage leg is omitted** and the remaining weights are **renormalized** (`rank_deals`). Tier scores still apply via **`NEIGHBORHOOD_CANONICAL`** / `NEIGHBORHOOD_SCORES` for the location component — there is **no** “tier median PSQM” or “district average” substitute for the missing baseline in current code.
+
+### Scraping
+
+- **XE / HTTP:** **`curl-cffi`** with configured Chrome impersonation where the code sets it; respect **`XE_*`** and Spitogatos pacing env vars.
+- **Cookies / bootstrap:** Playwright paths and Obscura when present — follow `scraper/xe/` and `cookies/cookie_manager.py`.
+- Do not bypass established session and retry patterns (403/429 handling, backoff) documented in scraper modules.
+
+### Layer 0 / Layer 2 (brief)
+
+- **Layer 0** (`layer_0_cleaner`): copy ingested → updated; remove missing neighborhood, **>180 days** publication age, **≤2** photo URLs (needs **≥3**).
+- **Layer 2** (`layer_2_aesthetic_filter`): aesthetic / thin-neighborhood gate after Layer 1 — follow existing thresholds and `db_conductor` helpers.
+
+---
+
+## DON’T
+
+- **No hallucinated fields:** if year, energy, etc. are unknown, keep **None** / absent and let scoring coercions handle them (`_year_component`, `_energy_component`, etc.).
+- **No ad hoc `sqlite3.connect`** in scraper, AI, or scoring **conductor** layers — go through **`db_conductor`** / **`core`** as above.
+- **Avoid new global mutable config** — prefer **`paths.py`**, module constants, or **`os.environ`** already used by scrapers and Layer 1.
+- **Do not replace the vision stack** with ad-hoc high-res image posts to Ollama; keep **384×384** (or env-tuned) resizing.
+- **Do not invent baseline fallbacks** (tier median / district PSQM) unless you implement them end-to-end in `market_analytics` + `rank_deals` and update `.ai/architecture.md`.
+
+---
+
+## Tech stack (reference)
+
+| Area | Stack |
+|------|--------|
+| Runtime | Python 3.11+ |
+| DB | SQLite: `ingested_listings.db`, `updated_listings.db`, `final_deals.db` under `data/` |
+| Vision | Ollama: **Moondream** (describe) + **llama3** (JSON score) by default |
+| HTTP scrape | **curl-cffi**, **httpx** where used; Playwright for cookies / XE bootstrap |
+| Merge | **imagehash** / Pillow for pHash dedupe in `run_all` |

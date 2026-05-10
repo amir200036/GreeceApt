@@ -10,17 +10,26 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_DIR = PROJECT_ROOT / "data"
+from greeceapt.db_helpers import paths
+from greeceapt.db_helpers.util import parse_photo_urls_json
 
-INGESTED_DB = DATA_DIR / "ingested_listings.db"
-UPDATED_DB  = DATA_DIR / "updated_listings.db"
-FINAL_DB    = DATA_DIR / "final_deals.db"
+# Module-level bindings so tests can ``monkeypatch.setattr(db_conductor, \"INGESTED_DB\", ...)``.
+DATA_DIR = paths.DATA_DIR
+INGESTED_DB = paths.INGESTED_DB
+UPDATED_DB = paths.UPDATED_DB
+FINAL_DB = paths.FINAL_DB
 
 
 # ── Connection factories ──────────────────────────────────────────────────────
+
+def connect_ingested() -> sqlite3.Connection:
+    return sqlite3.connect(INGESTED_DB)
+
+
+def connect_ingested_readonly() -> sqlite3.Connection:
+    return sqlite3.connect(f"file:{INGESTED_DB}?mode=ro", uri=True)
+
 
 def connect_updated() -> sqlite3.Connection:
     return sqlite3.connect(UPDATED_DB)
@@ -96,7 +105,6 @@ def _ensure_layer1_columns(conn: sqlite3.Connection) -> None:
     for col, typedef in [
         ("layer_1_processed", "INTEGER DEFAULT 0"),
         ("visual_score",      "REAL"),
-        ("aesthetic_grade",   "REAL"),
         ("layer_1_features",  "TEXT"),
     ]:
         if col not in existing:
@@ -178,10 +186,7 @@ def get_listings_for_layer1(conn: sqlite3.Connection) -> list[tuple[str, list[st
     ).fetchall()
     result = []
     for lid, photo_urls_json in rows:
-        try:
-            urls = json.loads(photo_urls_json) if photo_urls_json else []
-        except (ValueError, TypeError):
-            urls = []
+        urls = parse_photo_urls_json(photo_urls_json)
         if urls:
             result.append((str(lid), urls))
     return result
@@ -192,25 +197,26 @@ def save_visual_audit_results(
     listing_id: str | int,
     visual_score: float | None,
     features: dict,
+    *,
+    commit: bool = True,
 ) -> None:
     """Persist Layer 1 Moondream results for a listing."""
     conn.execute(
         """
         UPDATE listings
         SET    visual_score       = ?,
-               aesthetic_grade   = ?,
                layer_1_processed = 1,
                layer_1_features  = ?
         WHERE  id = ?
         """,
         (
             visual_score,
-            visual_score,
             json.dumps(features) if features else None,
             str(listing_id),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def remove_low_aesthetic_listings(  # called by layer_2_aesthetic_filter
@@ -218,12 +224,12 @@ def remove_low_aesthetic_listings(  # called by layer_2_aesthetic_filter
     threshold: float,
     layer_name: str = "Layer 2",
 ) -> int:
-    """Move all listings with aesthetic_grade below threshold to removed_listings. Returns count."""
+    """Move all listings with visual_score below threshold to removed_listings. Returns count."""
     rows = conn.execute(
         """
-        SELECT id, aesthetic_grade FROM listings
-        WHERE aesthetic_grade IS NULL
-           OR CAST(aesthetic_grade AS REAL) < ?
+        SELECT id, visual_score FROM listings
+        WHERE visual_score IS NULL
+           OR CAST(visual_score AS REAL) < ?
         """,
         (threshold,),
     ).fetchall()
@@ -280,7 +286,7 @@ def get_all_visual_scores(conn: sqlite3.Connection) -> dict[str, float]:
 
 def get_listings_for_baseline(
     conn: sqlite3.Connection,
-    min_aesthetic_grade: float,
+    min_visual_score: float,
 ) -> list[dict]:
     """Return listing dicts for neighborhood baseline computation."""
     rows = conn.execute(
@@ -292,10 +298,10 @@ def get_listings_for_baseline(
           AND CAST(area_sqm AS REAL) > 0
           AND neighborhood   IS NOT NULL
           AND TRIM(neighborhood) != ''
-          AND aesthetic_grade IS NOT NULL
-          AND CAST(aesthetic_grade AS REAL) >= ?
+          AND visual_score IS NOT NULL
+          AND CAST(visual_score AS REAL) >= ?
         """,
-        (min_aesthetic_grade,),
+        (min_visual_score,),
     ).fetchall()
     return [
         {"neighborhood": r[0], "price_eur": r[1], "area_sqm": r[2], "floor": r[3]}

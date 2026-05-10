@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -24,10 +23,17 @@ def run() -> None:
     src_conn = db_conductor.connect_updated_readonly()
     try:
         listing_data = db_conductor.get_listings_for_baseline(src_conn, MIN_AESTHETIC_GRADE)
-        baselines = compute_neighborhood_baselines(listing_data)
+        baselines, excluded_hoods, min_n = compute_neighborhood_baselines(listing_data)
         for hood in sorted(baselines):
-            logger.info("  Baseline %s: €%.0f/sqm", hood, baselines[hood])
-        logger.info("Layer 3: %s neighborhood baselines computed.", len(baselines))
+            logger.info("  Neighborhood baseline %s: €%.0f/sqm (normalized)", hood, baselines[hood])
+        logger.info(
+            "Layer 3: %s neighborhood baselines (strict, n >= %s); "
+            "%s neighborhoods excluded (insufficient data: n < %s).",
+            len(baselines),
+            min_n,
+            excluded_hoods,
+            min_n,
+        )
     finally:
         src_conn.close()
 
@@ -48,7 +54,7 @@ def run() -> None:
         for name, cnt in hood_counts:
             name = str(name).strip()
             tier = NEIGHBORHOOD_CANONICAL.get(name)
-            avg  = baselines.get(name)
+            avg = baselines.get(name)
             hood_rows.append((name, cnt, round(avg, 1) if avg else None, tier))
         hood_rows.sort(key=lambda r: (r[3] is not None, -r[1]))
         db_conductor.write_neighborhoods(dst_conn, hood_rows)
@@ -67,4 +73,7 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    from greeceapt.logging_config import configure_root_logging
+
+    configure_root_logging()
     run()
