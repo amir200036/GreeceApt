@@ -82,6 +82,26 @@ def test_blacklisted_photo_provides_no_evidence():
     assert all(len(g) == 1 for g in res.groups), "stock photo must not merge listings"
 
 
+def test_near_boilerplate_photos_provide_no_pair_evidence():
+    listings = []
+    for index, value in enumerate((0, 1, 2, 4, 8)):
+        row = _listing(f"u{index}", [])
+        row["photo_fingerprints"] = {
+            f"p{index}": {
+                "version": "phash-v2",
+                "full": f"{value:016x}",
+                "center": f"{(1 << (20 + index)):016x}",
+            }
+        }
+        listings.append(row)
+
+    result = dedupe.find_duplicate_groups(listings)
+
+    assert result.high_confidence_pairs == 0
+    assert result.review_pairs == []
+    assert sorted(result.groups) == [[0], [1], [2], [3], [4]]
+
+
 # ── Pair scoring ─────────────────────────────────────────────────────────────
 
 def _pair(a, b):

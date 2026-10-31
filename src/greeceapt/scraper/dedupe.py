@@ -26,6 +26,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from greeceapt.scraper.phash_index import analyze_photo_index
+
 logger = logging.getLogger(__name__)
 
 # ── Measured / chosen thresholds ─────────────────────────────────────────────
@@ -391,9 +393,12 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
     if not listings:
         return result
 
-    blacklist = build_common_photo_blacklist(listings)
-    result.blacklisted_photos = len(blacklist)
-    hashes = [listing_hash_ints(row, blacklist) for row in listings]
+    photo_analysis = analyze_photo_index(listings)
+    result.blacklisted_photos = len(photo_analysis.blacklisted_refs)
+    hashes = [
+        [photo.fingerprint.full for photo in photos if photo.fingerprint.full is not None]
+        for photos in photo_analysis.usable_photos_by_listing
+    ]
 
     pairs = candidate_pairs(listings)
     result.candidate_pairs = len(pairs)
