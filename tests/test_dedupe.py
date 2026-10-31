@@ -190,10 +190,56 @@ def test_geo_block_pairs_nearby_listings():
     assert (0, 1) in dedupe.candidate_pairs([a, b])
 
 
+def test_geo_candidates_cover_one_thousand_meters_across_grid_cells():
+    a = _listing("a", [], lat=37.98000, lon=23.7275, area_sqm=None, price_eur=None)
+    within = _listing("within", [], lat=37.98898, lon=23.7275, area_sqm=None, price_eur=None)
+    beyond = _listing("beyond", [], lat=37.98901, lon=23.7275, area_sqm=None, price_eur=None)
+
+    candidates = dedupe.candidate_pairs([a, within, beyond])
+
+    assert candidates[(0, 1)] == frozenset({"geo"})
+    assert (0, 2) not in candidates
+
+
+def test_metadata_block_covers_exact_relative_area_and_price_boundaries():
+    base = _listing("base", [], lat=None, lon=None, area_sqm=100.0, price_eur=100_000.0)
+    exact = _listing("exact", [], lat=None, lon=None, area_sqm=97.0, price_eur=75_000.0)
+    area_outside = _listing(
+        "area-outside", [], lat=None, lon=None, area_sqm=96.9, price_eur=100_000.0
+    )
+    price_outside = _listing(
+        "price-outside", [], lat=None, lon=None, area_sqm=100.0, price_eur=74_900.0
+    )
+
+    candidates = dedupe.candidate_pairs([base, exact, area_outside, price_outside])
+
+    assert candidates[(0, 1)] == frozenset({"metadata"})
+    assert (0, 2) not in candidates
+    assert (0, 3) not in candidates
+
+
+def test_photo_candidate_survives_when_geo_and_metadata_miss():
+    a = _listing("a", [], lat=37.9, lon=23.7, area_sqm=40.0, price_eur=50_000.0)
+    b = _listing("b", [], lat=38.1, lon=23.9, area_sqm=90.0, price_eur=200_000.0)
+
+    assert dedupe.candidate_pairs([a, b], [(1, 0)]) == {
+        (0, 1): frozenset({"photo"})
+    }
+
+
+def test_candidate_sources_are_unioned_without_duplicate_pairs():
+    a = _listing("a", [], area_sqm=100.0, price_eur=100_000.0)
+    b = _listing("b", [], area_sqm=99.0, price_eur=90_000.0)
+
+    assert dedupe.candidate_pairs([a, b], [(0, 1), (1, 0), (0, 1)]) == {
+        (0, 1): frozenset({"photo", "geo", "metadata"})
+    }
+
+
 def test_unrelated_listings_are_not_candidates():
     a = _listing("a", [_h(1)], lat=37.9838, lon=23.7275, area_sqm=40.0, price_eur=50_000.0)
     b = _listing("b", [_h(2)], lat=38.1000, lon=23.9000, area_sqm=95.0, price_eur=250_000.0)
-    assert dedupe.candidate_pairs([a, b]) == set()
+    assert dedupe.candidate_pairs([a, b]) == {}
 
 
 # ── Grouping and component validation ────────────────────────────────────────

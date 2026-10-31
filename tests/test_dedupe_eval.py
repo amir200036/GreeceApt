@@ -137,3 +137,16 @@ def test_legacy_full_pipeline_reproduces_frozen_live_outcomes():
 
     assert merged_pairs == payload["expected_high_pairs"]
     assert review_pairs == payload["expected_review_pairs"]
+
+
+def test_v2_candidate_generation_keeps_all_historical_positives():
+    from greeceapt.scraper import dedupe
+
+    payload = _read_fixture(HISTORICAL_FIXTURE)
+
+    proposed = sum(
+        (0, 1) in dedupe.candidate_pairs([record["kept"], record["absorbed"]])
+        for record in payload["positive_pairs"]
+    )
+
+    assert proposed == 1_224

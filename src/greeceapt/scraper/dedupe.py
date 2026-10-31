@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Iterable, Literal, Sequence
 
 from greeceapt.scraper.phash_index import analyze_photo_index
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ── Measured / chosen thresholds ─────────────────────────────────────────────
 
 PHASH_HAMMING_THRESHOLD = 5      # unchanged from the original implementation
-GEO_CELL_M = 250.0               # 3x3 scan => ~750 m reach => ~98.5% of true pairs
+GEO_CELL_M = 250.0               # indexed broadly, then confirmed at the 1,000 m boundary
 AREA_REL_TOLERANCE = 0.03
 PRICE_REL_TOLERANCE = 0.25       # measured max divergence 21.4%
 PHOTO_MATCH_MIN = 0.34           # >= 1 in 3 photos must pair up
@@ -138,19 +138,24 @@ def _as_float(value: Any) -> float | None:
 
 # ── Blocking ──────────────────────────────────────────────────────────────────
 
-def candidate_pairs(listings: Sequence[dict]) -> set[tuple[int, int]]:
-    """
-    Index pairs worth comparing in full, from the union of two independent blocking keys.
+CandidateSource = Literal["photo", "geo", "metadata"]
+CandidateMap = dict[tuple[int, int], frozenset[CandidateSource]]
 
-    1. **Geo grid** — same or adjacent ~250 m cell. Catches the ~98.5% of true duplicates
-       whose coordinates agree to within roughly 750 m.
-    2. **(rounded area, price bucket)** — geo-free, so it still recovers the tail of pairs
-       whose coordinates disagree wildly (the measured maximum was 2.6 km).
+
+def candidate_pairs(
+    listings: Sequence[dict],
+    photo_pairs: Iterable[tuple[int, int]] = (),
+) -> CandidateMap:
+    """
+    Index pairs worth comparing in full, with every proposing source retained.
+
+    1. **Photo bands** — confirmed near-pHash pairs supplied by ``analyze_photo_index``.
+    2. **Geo grid** — expanded 250 m cells, Haversine-confirmed through 1,000 m.
+    3. **Metadata ranges** — the exact 3% area and 25% price tolerances.
 
     Neither key is a filter on its own; both only propose pairs for scoring.
     """
     geo_cells: dict[tuple[int, int], list[int]] = {}
-    meta_cells: dict[tuple[int, int], list[int]] = {}
 
     for idx, listing in enumerate(listings):
         coords = _coords(listing)
@@ -161,40 +166,47 @@ def candidate_pairs(listings: Sequence[dict]) -> set[tuple[int, int]]:
             cell_lon = int(lon * lon_m // GEO_CELL_M)
             geo_cells.setdefault((cell_lat, cell_lon), []).append(idx)
 
-        area = _as_float(listing.get("area_sqm"))
-        price = _as_float(listing.get("price_eur"))
-        if area is not None and area > 0 and price is not None and price > 0:
-            meta_cells.setdefault((int(round(area)), int(price // 5000)), []).append(idx)
+    sources: dict[tuple[int, int], set[CandidateSource]] = {}
 
-    pairs: set[tuple[int, int]] = set()
+    def add_pair(left: int, right: int, source: CandidateSource) -> None:
+        if left == right or not (0 <= left < len(listings)) or not (0 <= right < len(listings)):
+            return
+        sources.setdefault(tuple(sorted((left, right))), set()).add(source)
+
+    for left, right in photo_pairs:
+        add_pair(left, right, "photo")
 
     for (clat, clon), bucket in geo_cells.items():
         neighbourhood: list[int] = []
-        for dlat in (-1, 0, 1):
-            for dlon in (-1, 0, 1):
+        cell_radius = math.ceil(1_000.0 / GEO_CELL_M) + 1
+        for dlat in range(-cell_radius, cell_radius + 1):
+            for dlon in range(-cell_radius, cell_radius + 1):
                 neighbourhood.extend(geo_cells.get((clat + dlat, clon + dlon), ()))
         for i in bucket:
             for j in neighbourhood:
-                if i < j:
-                    pairs.add((i, j))
-                elif j < i:
-                    pairs.add((j, i))
+                if i == j:
+                    continue
+                coords_i, coords_j = _coords(listings[i]), _coords(listings[j])
+                if coords_i and coords_j and haversine_m(*coords_i, *coords_j) <= 1_000.0:
+                    add_pair(i, j, "geo")
 
-    # Area buckets are exact, so also scan the adjacent ones — 49.6 and 50.4 sqm both
-    # round into neighbouring integers but are the same flat.
-    for (area_key, price_key), bucket in meta_cells.items():
-        neighbourhood = []
-        for da in (-1, 0, 1):
-            for dp in (-1, 0, 1):
-                neighbourhood.extend(meta_cells.get((area_key + da, price_key + dp), ()))
-        for i in bucket:
-            for j in neighbourhood:
-                if i < j:
-                    pairs.add((i, j))
-                elif j < i:
-                    pairs.add((j, i))
+    metadata_rows = sorted(
+        (area, price, index)
+        for index, listing in enumerate(listings)
+        if (area := _as_float(listing.get("area_sqm"))) is not None and area > 0
+        and (price := _as_float(listing.get("price_eur"))) is not None and price > 0
+    )
+    for position, (area, price, index) in enumerate(metadata_rows):
+        maximum_area = area / (1.0 - AREA_REL_TOLERANCE)
+        for other_area, other_price, other_index in metadata_rows[position + 1:]:
+            if other_area > maximum_area:
+                break
+            area_delta = abs(area - other_area) / max(area, other_area)
+            price_delta = abs(price - other_price) / max(price, other_price)
+            if area_delta <= AREA_REL_TOLERANCE and price_delta <= PRICE_REL_TOLERANCE:
+                add_pair(index, other_index, "metadata")
 
-    return pairs
+    return {pair: frozenset(pair_sources) for pair, pair_sources in sorted(sources.items())}
 
 
 # ── Pair scoring ──────────────────────────────────────────────────────────────
@@ -400,7 +412,7 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
         for photos in photo_analysis.usable_photos_by_listing
     ]
 
-    pairs = candidate_pairs(listings)
+    pairs = candidate_pairs(listings, photo_analysis.photo_candidate_pairs)
     result.candidate_pairs = len(pairs)
 
     uf = UnionFind(len(listings))
