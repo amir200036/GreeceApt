@@ -78,6 +78,7 @@ def pipeline_tmp(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(run_all, "STALE_JSON", tmp_path / "stale_listings.json")
     monkeypatch.setattr(run_all, "XE_JSON", tmp_path / "xe_listings.json")
     monkeypatch.setattr(run_all, "SPITOGATOS_JSON", tmp_path / "spitogatos_listings.json")
+    monkeypatch.setattr(scraper_util.paths, "PHASH_CACHE_JSON", tmp_path / "phash_cache.json")
 
     monkeypatch.setattr(ai_conductor, "DATA_DIR", tmp_path)
     yield tmp_path

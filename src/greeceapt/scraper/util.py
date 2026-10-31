@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,9 @@ from typing import Any
 import httpx
 import imagehash
 from PIL import Image
+
+from greeceapt.db_helpers import paths
+from greeceapt.scraper.fingerprints import PhotoFingerprint, fingerprint_image
 
 # ── XE.gr search URLs ─────────────────────────────────────────────────────────
 
@@ -164,54 +168,121 @@ def listing_has_photos_and_recent_publication(
     return dt >= publication_stale_cutoff_utc(days)
 
 
-def load_url_hash_cache_from_listings_json(output_json: Path) -> dict[str, str]:
-    """Build {photo_url: phash hex} from ``photo_url_hashes`` in an existing ``listings.json``."""
-    if not output_json.exists():
+def load_standalone_phash_cache(cache_json: Path | None = None) -> dict[str, PhotoFingerprint]:
+    """Load legacy strings and versioned URL→fingerprint cache records."""
+    path = cache_json if cache_json is not None else paths.PHASH_CACHE_JSON
+    if not path.exists():
         return {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    cache: dict[str, PhotoFingerprint] = {}
+    for url, value in data.items():
+        fingerprint = PhotoFingerprint.from_json(value)
+        if url and fingerprint is not None:
+            cache[str(url)] = fingerprint
+    return cache
+
+
+def save_standalone_phash_cache(
+    cache: dict[str, PhotoFingerprint | str],
+    cache_json: Path | None = None,
+) -> None:
+    """Persist versioned records atomically so a wiped listing store costs no re-downloads."""
+    path = cache_json if cache_json is not None else paths.PHASH_CACHE_JSON
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    serialized = {}
+    for url, value in cache.items():
+        fingerprint = value if isinstance(value, PhotoFingerprint) else PhotoFingerprint.from_json(value)
+        if fingerprint is not None:
+            serialized[url] = fingerprint.to_json()
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(serialized, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_url_hash_cache_from_listings_json(output_json: Path) -> dict[str, PhotoFingerprint]:
+    """
+    Build ``{photo_url: phash hex}`` for the merge.
+
+    Seeded from the standalone cache (which outlives ``listings.json``), then
+    overlaid with ``photo_url_hashes`` from an existing ``listings.json`` when present.
+    """
+    cache = load_standalone_phash_cache()
+    if not output_json.exists():
+        return cache
     try:
         with output_json.open(encoding="utf-8") as f:
             data = json.load(f)
-        cache: dict[str, str] = {}
         for listing in data:
             for url, h in (listing.get("photo_url_hashes") or {}).items():
-                cache[url] = h
-        return cache
+                fingerprint = PhotoFingerprint.from_json(h)
+                if fingerprint is not None:
+                    cache[url] = fingerprint
+            for url, value in (listing.get("photo_fingerprints") or {}).items():
+                fingerprint = PhotoFingerprint.from_json(value)
+                if fingerprint is not None:
+                    cache[url] = fingerprint
     except Exception:
-        return {}
+        return cache
+    return cache
 
 
-async def compute_listing_photo_hashes(
+async def compute_listing_photo_fingerprints(
     photo_urls: list[str],
-    url_cache: dict[str, str],
+    url_cache: dict[str, PhotoFingerprint],
     sem: asyncio.Semaphore,
     client: httpx.AsyncClient,
-) -> dict[str, str]:
-    """Return {url: phash hex}; updates ``url_cache`` for newly hashed URLs."""
-    result: dict[str, str] = {}
+) -> dict[str, PhotoFingerprint]:
+    """Return complete v2 fingerprints, lazily upgrading full-only legacy entries."""
+    result: dict[str, PhotoFingerprint] = {}
     to_download: list[str] = []
     for url in photo_urls:
-        if url in url_cache:
-            result[url] = url_cache[url]
+        cached = url_cache.get(url)
+        if cached is not None and cached.is_complete_v2:
+            result[url] = cached
         else:
             to_download.append(url)
 
-    async def _one(url: str) -> tuple[str, str | None]:
+    async def _one(url: str) -> tuple[str, PhotoFingerprint | None]:
         async with sem:
             try:
                 resp = await client.get(url, timeout=15.0)
                 resp.raise_for_status()
-                img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-                return url, str(imagehash.phash(img))
+                with Image.open(io.BytesIO(resp.content)) as image:
+                    return url, fingerprint_image(image)
             except Exception:
                 return url, None
 
     if to_download:
         downloads = await asyncio.gather(*(_one(u) for u in to_download))
-        for url, h in downloads:
-            if h is not None:
-                result[url] = h
-                url_cache[url] = h
+        for url, fingerprint in downloads:
+            if fingerprint is not None:
+                result[url] = fingerprint
+                url_cache[url] = fingerprint
     return result
+
+
+async def compute_listing_photo_hashes(
+    photo_urls: list[str],
+    url_cache: dict[str, PhotoFingerprint],
+    sem: asyncio.Semaphore,
+    client: httpx.AsyncClient,
+) -> dict[str, str]:
+    """Compatibility adapter returning only full hashes until pipeline Task 7 migrates."""
+    fingerprints = await compute_listing_photo_fingerprints(photo_urls, url_cache, sem, client)
+    return {
+        url: f"{fingerprint.full:016x}"
+        for url, fingerprint in fingerprints.items()
+        if fingerprint.full is not None
+    }
 
 
 def phash_duplicate_groups(
