@@ -131,6 +131,22 @@ def test_listing_cache_prefers_v2_over_legacy_hash(tmp_path, monkeypatch):
     )
 
 
+def test_listing_legacy_hash_does_not_downgrade_standalone_v2_cache(tmp_path, monkeypatch):
+    standalone = tmp_path / "phash_cache.json"
+    v2 = fingerprints.PhotoFingerprint("phash-v2", 2, 3)
+    scraper_util.save_standalone_phash_cache({"photo-1": v2}, standalone)
+    monkeypatch.setattr(scraper_util.paths, "PHASH_CACHE_JSON", standalone)
+    listings = tmp_path / "listings.json"
+    listings.write_text(
+        json.dumps([{
+            "photo_url_hashes": {"photo-1": "0000000000000001"},
+        }]),
+        encoding="utf-8",
+    )
+
+    assert scraper_util.load_url_hash_cache_from_listings_json(listings)["photo-1"] == v2
+
+
 def test_legacy_cache_entry_is_downloaded_and_upgraded():
     image = Image.new("RGB", (32, 32), color=(20, 40, 60))
     body = io.BytesIO()

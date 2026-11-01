@@ -224,11 +224,17 @@ def load_url_hash_cache_from_listings_json(output_json: Path) -> dict[str, Photo
         for listing in data:
             for url, h in (listing.get("photo_url_hashes") or {}).items():
                 fingerprint = PhotoFingerprint.from_json(h)
-                if fingerprint is not None:
+                current = cache.get(url)
+                if fingerprint is not None and (
+                    current is None or fingerprint.is_complete_v2 or not current.is_complete_v2
+                ):
                     cache[url] = fingerprint
             for url, value in (listing.get("photo_fingerprints") or {}).items():
                 fingerprint = PhotoFingerprint.from_json(value)
-                if fingerprint is not None:
+                current = cache.get(url)
+                if fingerprint is not None and (
+                    current is None or fingerprint.is_complete_v2 or not current.is_complete_v2
+                ):
                     cache[url] = fingerprint
     except Exception:
         return cache
