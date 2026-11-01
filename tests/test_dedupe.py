@@ -425,6 +425,9 @@ def test_complete_link_bridge_prefers_stronger_edge_and_emits_review():
     assert result.groups == ((0, 1), (2,))
     assert len(result.bridge_reviews) == 1
     assert result.bridge_reviews[0]["reason_code"] == "incomplete_high_clique"
+    assert result.bridge_reviews[0]["confidence"] == "REVIEW"
+    assert "matches" in result.bridge_reviews[0]
+    assert result.bridge_reviews[0]["candidate_sources"] == ["photo"]
     assert result.bridge_reviews[0]["component_ids"] == ["a", "b", "c"]
 
 

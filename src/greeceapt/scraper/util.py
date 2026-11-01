@@ -358,6 +358,27 @@ def merge_duplicate_listing_into_kept(
             existing["price_eur"] = i_price
             existing["publication_date"] = incoming.get("publication_date")
 
+    # Publication dates: keep BOTH ends rather than collapsing to one value.
+    # ``publication_date`` was previously only copied inside the price branches above, so a
+    # dated row absorbed into an undated one silently lost its date (measured: 15% coverage
+    # on merged rows vs 100% on Spitogatos alone) — and Layer 0's staleness filter reads it.
+    # earliest → how long the property has really been on the market (days-on-market signal);
+    # latest   → freshness, which is what the staleness filter wants.
+    _dates = [
+        d for d in (
+            existing_dt,
+            incoming_dt,
+            parse_publication_date_string(existing.get("earliest_publication_date")),
+            parse_publication_date_string(incoming.get("earliest_publication_date")),
+            parse_publication_date_string(existing.get("latest_publication_date")),
+            parse_publication_date_string(incoming.get("latest_publication_date")),
+        ) if d is not None
+    ]
+    if _dates:
+        existing["earliest_publication_date"] = min(_dates).date().isoformat()
+        existing["latest_publication_date"] = max(_dates).date().isoformat()
+        existing["publication_date"] = max(_dates).date().isoformat()
+
     seen: set[str] = set(existing.get("source_urls") or [])
     seen.update(incoming.get("source_urls") or [])
     existing["source_urls"] = sorted(seen)
@@ -375,11 +396,17 @@ def merge_duplicate_listing_into_kept(
     incoming_photos = incoming.get("photo_urls") or []
     if len(incoming_photos) > len(existing_photos):
         existing["photo_urls"] = incoming_photos
-        existing["photos_count"] = len(incoming_photos)
+    # Recount unconditionally — photos_count was only refreshed inside the branch above,
+    # so a survivor kept a stale count whenever the absorbed row had fewer photos.
+    existing["photos_count"] = len(existing.get("photo_urls") or [])
 
     existing["photo_url_hashes"] = {
         **(existing.get("photo_url_hashes") or {}),
         **(incoming.get("photo_url_hashes") or {}),
+    }
+    existing["photo_fingerprints"] = {
+        **(existing.get("photo_fingerprints") or {}),
+        **(incoming.get("photo_fingerprints") or {}),
     }
     all_hashes: set[str] = set(existing.get("image_hashes") or [])
     all_hashes.update(incoming.get("image_hashes") or [])

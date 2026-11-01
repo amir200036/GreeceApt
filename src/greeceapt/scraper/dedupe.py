@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -326,6 +327,35 @@ class PairEvidence:
         return self.confidence == "HIGH"
 
 
+def pair_evidence_record(a: dict, b: dict, evidence: PairEvidence) -> dict:
+    """Convert immutable pair evidence into the stable review/audit JSON contract."""
+    return {
+        "a_url": a.get("url") or a.get("id"),
+        "b_url": b.get("url") or b.get("id"),
+        "candidate_sources": sorted(evidence.candidate_sources),
+        "matches": [
+            {
+                "a_photo_key": match.a_photo_key,
+                "b_photo_key": match.b_photo_key,
+                "distance": match.distance,
+                "variant": match.variant,
+            }
+            for match in evidence.matches
+        ],
+        "full_matches": evidence.full_matches,
+        "center_matches": evidence.center_matches,
+        "photo_match_frac": evidence.photo_match_frac,
+        "matched_photos": evidence.matched_photos,
+        "min_hamming": evidence.min_hamming,
+        "geo_distance_m": evidence.geo_distance_m,
+        "price_rel_delta": evidence.price_rel_delta,
+        "agreeing_fields": evidence.agreeing_fields,
+        "conflicting_fields": list(evidence.conflicting_fields),
+        "reason_code": evidence.reason_code,
+        "confidence": evidence.confidence,
+    }
+
+
 def evaluate_pair(
     a: dict,
     b: dict,
@@ -467,12 +497,15 @@ def complete_link_groups(
             for pair in cross_pairs
             if pair not in evidence or evidence[pair].confidence != "HIGH"
         ]
-        bridge_reviews.append({
+        bridge_review = pair_evidence_record(listings[left], listings[right], _edge_evidence)
+        bridge_review.update({
             "reason_code": "incomplete_high_clique",
+            "confidence": "REVIEW",
             "blocked_edge_ids": sorted((stable_ids[left], stable_ids[right])),
             "component_ids": list(component_ids),
             "non_high_pair_ids": sorted(non_high),
         })
+        bridge_reviews.append(bridge_review)
 
     groups = tuple(sorted(
         (tuple(sorted(members)) for members in clusters.values()),
@@ -514,6 +547,9 @@ class DedupeResult:
     high_confidence_pairs: int = 0
     split_components: int = 0
     pair_evidence: dict[tuple[int, int], PairEvidence] = field(default_factory=dict)
+    candidate_pairs_by_source: dict[str, int] = field(default_factory=dict)
+    blacklist_family_count: int = 0
+    pair_scoring_seconds: float = 0.0
 
 
 def validate_component(listings: Sequence[dict], members: Sequence[int]) -> bool:
@@ -541,12 +577,18 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
 
     photo_analysis = analyze_photo_index(listings)
     result.blacklisted_photos = len(photo_analysis.blacklisted_refs)
+    result.blacklist_family_count = photo_analysis.blacklist_family_count
     photos = photo_analysis.usable_photos_by_listing
 
     pairs = candidate_pairs(listings, photo_analysis.photo_candidate_pairs)
     result.candidate_pairs = len(pairs)
+    result.candidate_pairs_by_source = {
+        source: sum(source in sources for sources in pairs.values())
+        for source in ("photo", "geo", "metadata")
+    }
 
     high_edges = 0
+    scoring_started = time.perf_counter()
     for i, j in sorted(pairs):
         if not photos[i] or not photos[j]:
             continue
@@ -555,21 +597,8 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
         if ev.is_high:
             high_edges += 1
         elif ev.confidence == "REVIEW":
-            result.review_pairs.append({
-                "a_url": listings[i].get("url"),
-                "b_url": listings[j].get("url"),
-                "photo_match_frac": ev.photo_match_frac,
-                "matched_photos": ev.matched_photos,
-                "min_hamming": ev.min_hamming,
-                "geo_distance_m": ev.geo_distance_m,
-                "price_rel_delta": ev.price_rel_delta,
-                "agreeing_fields": ev.agreeing_fields,
-                "conflicting_fields": list(ev.conflicting_fields),
-                "candidate_sources": sorted(ev.candidate_sources),
-                "full_matches": ev.full_matches,
-                "center_matches": ev.center_matches,
-                "reason_code": ev.reason_code,
-            })
+            result.review_pairs.append(pair_evidence_record(listings[i], listings[j], ev))
+    result.pair_scoring_seconds = time.perf_counter() - scoring_started
     result.high_confidence_pairs = high_edges
     grouping = complete_link_groups(listings, result.pair_evidence)
     result.groups = [list(group) for group in grouping.groups]
