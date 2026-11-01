@@ -185,7 +185,7 @@ def candidate_pairs(
                 neighbourhood.extend(geo_cells.get((clat + dlat, clon + dlon), ()))
         for i in bucket:
             for j in neighbourhood:
-                if i == j:
+                if i >= j:
                     continue
                 coords_i, coords_j = _coords(listings[i]), _coords(listings[j])
                 if coords_i and coords_j and haversine_m(*coords_i, *coords_j) <= 1_000.0:
@@ -590,6 +590,11 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
     high_edges = 0
     scoring_started = time.perf_counter()
     for i, j in sorted(pairs):
+        # The photo band index has exact recall for every Hamming distance < 5.
+        # Geo/metadata-only pairs therefore have zero possible photo matches and cannot
+        # reach REVIEW or HIGH; avoid an expensive Cartesian photo comparison for them.
+        if "photo" not in pairs[(i, j)]:
+            continue
         if not photos[i] or not photos[j]:
             continue
         ev = evaluate_pair(listings[i], listings[j], photos[i], photos[j], pairs[(i, j)])

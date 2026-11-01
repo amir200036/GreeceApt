@@ -150,3 +150,34 @@ def test_v2_candidate_generation_keeps_all_historical_positives():
     )
 
     assert proposed == 1_224
+
+
+def test_final_evaluation_meets_corpus_and_hard_negative_gates():
+    dedupe_eval = importlib.import_module("greeceapt.scraper.dedupe_eval")
+
+    report = dedupe_eval.evaluate_corpora(
+        HISTORICAL_FIXTURE,
+        LIVE_FIXTURE,
+        benchmark_repeats=1,
+    )
+
+    assert report.historical_positive_pairs == 1_224
+    assert report.historical_positive_candidates == 1_224
+    assert report.isolated_automatic == 1_064
+    assert report.demoted_low_photo == 53
+    assert report.live_high_pairs == 6
+    assert report.live_review_pairs == 1
+    assert report.hard_negative_cases == 6
+    assert report.hard_negative_automatic == 0
+    assert report.runtime_ratio <= 2.0
+
+
+def test_evaluation_report_uses_historical_positive_coverage_language():
+    dedupe_eval = importlib.import_module("greeceapt.scraper.dedupe_eval")
+    report = dedupe_eval.EvaluationReport.empty()
+
+    rendered = dedupe_eval.render_markdown(report).lower()
+
+    assert "historical-positive coverage" in rendered
+    assert "accuracy" not in rendered
+    assert "precision" not in rendered
