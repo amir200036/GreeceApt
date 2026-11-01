@@ -26,7 +26,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal, Sequence
 
-from greeceapt.scraper.phash_index import analyze_photo_index
+from greeceapt.scraper.phash_index import PhotoRef, analyze_photo_index
 
 logger = logging.getLogger(__name__)
 
@@ -211,43 +211,63 @@ def candidate_pairs(
 
 # ── Pair scoring ──────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class PhotoMatch:
+    a_photo_key: str
+    b_photo_key: str
+    distance: int
+    variant: Literal["full", "center"]
+
+
+def _photo_edges(
+    photos_a: Sequence[PhotoRef],
+    photos_b: Sequence[PhotoRef],
+    threshold: int,
+) -> tuple[list[PhotoMatch], int]:
+    edges: list[PhotoMatch] = []
+    minimum = 64
+    for photo_a in photos_a:
+        for photo_b in photos_b:
+            for variant in ("full", "center"):
+                hash_a = getattr(photo_a.fingerprint, variant)
+                hash_b = getattr(photo_b.fingerprint, variant)
+                if hash_a is None or hash_b is None:
+                    continue
+                distance = hamming(hash_a, hash_b)
+                minimum = min(minimum, distance)
+                if distance < threshold:
+                    edges.append(PhotoMatch(
+                        photo_a.photo_key,
+                        photo_b.photo_key,
+                        distance,
+                        variant,
+                    ))
+    edges.sort(key=lambda match: (
+        match.distance,
+        match.a_photo_key,
+        match.b_photo_key,
+        match.variant,
+    ))
+    return edges, minimum
+
+
 def greedy_photo_matching(
-    hashes_a: Sequence[int],
-    hashes_b: Sequence[int],
+    photos_a: Sequence[PhotoRef],
+    photos_b: Sequence[PhotoRef],
     threshold: int = PHASH_HAMMING_THRESHOLD,
-) -> tuple[int, int]:
-    """
-    One-to-one photo pairing. Returns ``(matched_pairs, min_hamming)``.
-
-    One-to-one matters: counting "does this photo resemble anything over there" lets a
-    single photo in A match three near-identical photos in B and report three matches,
-    inflating the match fraction. Greedy on ascending distance is sufficient and exact
-    enough for the 8–30 photos a listing carries; a Hungarian solve would be overkill.
-    """
-    if not hashes_a or not hashes_b:
-        return 0, 64
-
-    scored: list[tuple[int, int, int]] = []
-    min_d = 64
-    for i, ha in enumerate(hashes_a):
-        for j, hb in enumerate(hashes_b):
-            d = hamming(ha, hb)
-            if d < min_d:
-                min_d = d
-            if d < threshold:
-                scored.append((d, i, j))
-
-    scored.sort()
-    used_a: set[int] = set()
-    used_b: set[int] = set()
-    matched = 0
-    for _d, i, j in scored:
-        if i in used_a or j in used_b:
+) -> tuple[PhotoMatch, ...]:
+    """Select deterministic one-to-one matches across like-for-like hash variants."""
+    edges, _minimum = _photo_edges(photos_a, photos_b, threshold)
+    used_a: set[str] = set()
+    used_b: set[str] = set()
+    matches: list[PhotoMatch] = []
+    for match in edges:
+        if match.a_photo_key in used_a or match.b_photo_key in used_b:
             continue
-        used_a.add(i)
-        used_b.add(j)
-        matched += 1
-    return matched, min_d
+        used_a.add(match.a_photo_key)
+        used_b.add(match.b_photo_key)
+        matches.append(match)
+    return tuple(matches)
 
 
 def metadata_agreement(a: dict, b: dict) -> tuple[int, tuple[str, ...]]:
@@ -287,6 +307,10 @@ def metadata_agreement(a: dict, b: dict) -> tuple[int, tuple[str, ...]]:
 
 @dataclass(frozen=True)
 class PairEvidence:
+    candidate_sources: frozenset[str]
+    matches: tuple[PhotoMatch, ...]
+    full_matches: int
+    center_matches: int
     photo_match_frac: float
     matched_photos: int
     min_hamming: int
@@ -294,18 +318,27 @@ class PairEvidence:
     price_rel_delta: float | None
     agreeing_fields: int
     conflicting_fields: tuple[str, ...]
-    confidence: str  # "HIGH" | "REVIEW" | "NONE"
+    reason_code: str
+    confidence: Literal["HIGH", "REVIEW", "NONE"]
 
     @property
     def is_high(self) -> bool:
         return self.confidence == "HIGH"
 
 
-def evaluate_pair(a: dict, b: dict, hashes_a: Sequence[int], hashes_b: Sequence[int]) -> PairEvidence:
+def evaluate_pair(
+    a: dict,
+    b: dict,
+    photos_a: Sequence[PhotoRef],
+    photos_b: Sequence[PhotoRef],
+    candidate_sources: Iterable[str] = (),
+) -> PairEvidence:
     """Score one candidate pair into HIGH / REVIEW / NONE."""
-    matched, min_d = greedy_photo_matching(hashes_a, hashes_b)
-    denom = min(len(hashes_a), len(hashes_b))
-    frac = (matched / denom) if denom else 0.0
+    _edges, min_d = _photo_edges(photos_a, photos_b, PHASH_HAMMING_THRESHOLD)
+    matches = greedy_photo_matching(photos_a, photos_b)
+    matched = len(matches)
+    denom = min(len(photos_a), len(photos_b))
+    frac = matched / denom if denom else 0.0
 
     agreeing, conflicts = metadata_agreement(a, b)
 
@@ -319,24 +352,38 @@ def evaluate_pair(a: dict, b: dict, hashes_a: Sequence[int], hashes_b: Sequence[
     if pa and pb and max(pa, pb) > 0:
         price_delta = abs(pa - pb) / max(pa, pb)
 
-    confidence = "NONE"
+    confidence: Literal["HIGH", "REVIEW", "NONE"] = "NONE"
+    reason_code = "no_photo_matches"
     if conflicts:
-        # A disagreement on a field both sides actually state is decisive.
         confidence = "NONE"
+        reason_code = "area_conflict"
+    elif matched > 0 and price_delta is not None and price_delta > PRICE_REL_TOLERANCE:
+        confidence = "REVIEW"
+        reason_code = "price_gap"
+    elif matched == 0:
+        confidence = "NONE"
+        reason_code = "no_photo_matches"
+    elif matched < 3:
+        confidence = "REVIEW"
+        reason_code = "insufficient_photo_count"
     elif frac >= PHOTO_MATCH_SPARSE_META:
         confidence = "HIGH"
+        reason_code = "strong_photo_overlap"
     elif frac >= PHOTO_MATCH_MIN and agreeing >= MIN_CORROBORATORS:
         confidence = "HIGH"
+        reason_code = "corroborated_photo_overlap"
     elif frac >= PHOTO_MATCH_MIN:
         confidence = "REVIEW"
-    elif matched > 0:
+        reason_code = "uncorroborated_photo_overlap"
+    else:
         confidence = "REVIEW"
-
-    if confidence != "NONE" and price_delta is not None and price_delta > PRICE_REL_TOLERANCE:
-        # Same photos but a price gap larger than any observed between portals.
-        confidence = "REVIEW"
+        reason_code = "low_photo_overlap"
 
     return PairEvidence(
+        candidate_sources=frozenset(candidate_sources),
+        matches=matches,
+        full_matches=sum(match.variant == "full" for match in matches),
+        center_matches=sum(match.variant == "center" for match in matches),
         photo_match_frac=round(frac, 4),
         matched_photos=matched,
         min_hamming=min_d,
@@ -344,6 +391,7 @@ def evaluate_pair(a: dict, b: dict, hashes_a: Sequence[int], hashes_b: Sequence[
         price_rel_delta=round(price_delta, 4) if price_delta is not None else None,
         agreeing_fields=agreeing,
         conflicting_fields=conflicts,
+        reason_code=reason_code,
         confidence=confidence,
     )
 
@@ -407,10 +455,7 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
 
     photo_analysis = analyze_photo_index(listings)
     result.blacklisted_photos = len(photo_analysis.blacklisted_refs)
-    hashes = [
-        [photo.fingerprint.full for photo in photos if photo.fingerprint.full is not None]
-        for photos in photo_analysis.usable_photos_by_listing
-    ]
+    photos = photo_analysis.usable_photos_by_listing
 
     pairs = candidate_pairs(listings, photo_analysis.photo_candidate_pairs)
     result.candidate_pairs = len(pairs)
@@ -418,9 +463,9 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
     uf = UnionFind(len(listings))
     high_edges = 0
     for i, j in sorted(pairs):
-        if not hashes[i] or not hashes[j]:
+        if not photos[i] or not photos[j]:
             continue
-        ev = evaluate_pair(listings[i], listings[j], hashes[i], hashes[j])
+        ev = evaluate_pair(listings[i], listings[j], photos[i], photos[j], pairs[(i, j)])
         if ev.is_high:
             uf.union(i, j)
             high_edges += 1
@@ -435,6 +480,10 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
                 "price_rel_delta": ev.price_rel_delta,
                 "agreeing_fields": ev.agreeing_fields,
                 "conflicting_fields": list(ev.conflicting_fields),
+                "candidate_sources": sorted(ev.candidate_sources),
+                "full_matches": ev.full_matches,
+                "center_matches": ev.center_matches,
+                "reason_code": ev.reason_code,
             })
     result.high_confidence_pairs = high_edges
 

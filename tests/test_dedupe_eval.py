@@ -98,7 +98,7 @@ def test_live_fixture_loader_rejects_free_text_fields(tmp_path):
         dedupe_eval.load_live_fixture(path)
 
 
-def test_legacy_positive_policy_pins_candidate_and_confidence_counts():
+def test_isolated_pair_policy_pins_candidate_and_confidence_counts():
     dedupe_eval = importlib.import_module("greeceapt.scraper.dedupe_eval")
     payload = _read_fixture(HISTORICAL_FIXTURE)
     pairs = [
