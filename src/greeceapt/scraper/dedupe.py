@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from greeceapt.scraper.phash_index import PhotoRef, analyze_photo_index
 
@@ -398,6 +398,91 @@ def evaluate_pair(
 
 # ── Grouping ──────────────────────────────────────────────────────────────────
 
+@dataclass(frozen=True)
+class GroupingResult:
+    groups: tuple[tuple[int, ...], ...]
+    bridge_reviews: tuple[dict, ...]
+
+
+def _stable_listing_id(listing: dict, index: int) -> str:
+    return str(listing.get("url") or listing.get("id") or f"index-{index:08d}")
+
+
+def complete_link_groups(
+    listings: Sequence[dict],
+    evidence: Mapping[tuple[int, int], PairEvidence],
+) -> GroupingResult:
+    """Agglomerate only clusters whose every cross-pair is directly ``HIGH``."""
+    stable_ids = [_stable_listing_id(listing, index) for index, listing in enumerate(listings)]
+    high_edges = [
+        (pair, pair_evidence)
+        for pair, pair_evidence in evidence.items()
+        if pair_evidence.confidence == "HIGH"
+    ]
+    high_edges.sort(key=lambda item: (
+        -item[1].matched_photos,
+        -item[1].photo_match_frac,
+        item[1].min_hamming,
+        min(stable_ids[item[0][0]], stable_ids[item[0][1]]),
+        max(stable_ids[item[0][0]], stable_ids[item[0][1]]),
+    ))
+
+    clusters: dict[int, set[int]] = {index: {index} for index in range(len(listings))}
+    member_cluster = list(range(len(listings)))
+    bridge_reviews: list[dict] = []
+    seen_reviews: set[tuple[str, ...]] = set()
+
+    for (left, right), _edge_evidence in high_edges:
+        root_left = member_cluster[left]
+        root_right = member_cluster[right]
+        if root_left == root_right:
+            continue
+        members_left = clusters[root_left]
+        members_right = clusters[root_right]
+        cross_pairs = [
+            tuple(sorted((member_left, member_right)))
+            for member_left in members_left
+            for member_right in members_right
+        ]
+        if all(
+            pair in evidence and evidence[pair].confidence == "HIGH"
+            for pair in cross_pairs
+        ):
+            keep_root, drop_root = min(root_left, root_right), max(root_left, root_right)
+            merged = members_left | members_right
+            clusters[keep_root] = merged
+            del clusters[drop_root]
+            for member in merged:
+                member_cluster[member] = keep_root
+            continue
+
+        component_ids = tuple(sorted(
+            stable_ids[member] for member in members_left | members_right
+        ))
+        if component_ids in seen_reviews:
+            continue
+        seen_reviews.add(component_ids)
+        non_high = [
+            [stable_ids[pair[0]], stable_ids[pair[1]]]
+            for pair in cross_pairs
+            if pair not in evidence or evidence[pair].confidence != "HIGH"
+        ]
+        bridge_reviews.append({
+            "reason_code": "incomplete_high_clique",
+            "blocked_edge_ids": sorted((stable_ids[left], stable_ids[right])),
+            "component_ids": list(component_ids),
+            "non_high_pair_ids": sorted(non_high),
+        })
+
+    groups = tuple(sorted(
+        (tuple(sorted(members)) for members in clusters.values()),
+        key=lambda group: group[0],
+    ))
+    bridge_reviews.sort(key=lambda review: (
+        review["component_ids"], review["blocked_edge_ids"]
+    ))
+    return GroupingResult(groups=groups, bridge_reviews=tuple(bridge_reviews))
+
 class UnionFind:
     def __init__(self, n: int) -> None:
         self._parent = list(range(n))
@@ -428,6 +513,7 @@ class DedupeResult:
     candidate_pairs: int = 0
     high_confidence_pairs: int = 0
     split_components: int = 0
+    pair_evidence: dict[tuple[int, int], PairEvidence] = field(default_factory=dict)
 
 
 def validate_component(listings: Sequence[dict], members: Sequence[int]) -> bool:
@@ -460,14 +546,13 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
     pairs = candidate_pairs(listings, photo_analysis.photo_candidate_pairs)
     result.candidate_pairs = len(pairs)
 
-    uf = UnionFind(len(listings))
     high_edges = 0
     for i, j in sorted(pairs):
         if not photos[i] or not photos[j]:
             continue
         ev = evaluate_pair(listings[i], listings[j], photos[i], photos[j], pairs[(i, j)])
+        result.pair_evidence[(i, j)] = ev
         if ev.is_high:
-            uf.union(i, j)
             high_edges += 1
         elif ev.confidence == "REVIEW":
             result.review_pairs.append({
@@ -486,23 +571,8 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
                 "reason_code": ev.reason_code,
             })
     result.high_confidence_pairs = high_edges
-
-    for members in uf.groups().values():
-        if len(members) == 1:
-            result.groups.append(members)
-            continue
-        if validate_component(listings, members):
-            result.groups.append(sorted(members))
-        else:
-            # Internally inconsistent: keep every member separate rather than risk a
-            # destructive merge, and surface it for review.
-            result.split_components += 1
-            logger.info(
-                "Dedupe: split inconsistent component of %s listings (%s)",
-                len(members),
-                [listings[m].get("url") for m in members],
-            )
-            result.groups.extend([m] for m in sorted(members))
-
-    result.groups.sort(key=lambda g: g[0])
+    grouping = complete_link_groups(listings, result.pair_evidence)
+    result.groups = [list(group) for group in grouping.groups]
+    result.review_pairs.extend(grouping.bridge_reviews)
+    result.split_components = len(grouping.bridge_reviews)
     return result

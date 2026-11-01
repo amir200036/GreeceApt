@@ -1,6 +1,7 @@
 """Tests for greeceapt.scraper.dedupe — entity resolution."""
 
 import hashlib
+import itertools
 
 from greeceapt.scraper import dedupe
 from greeceapt.scraper.fingerprints import PhotoFingerprint
@@ -358,16 +359,35 @@ def test_unrelated_listings_are_not_candidates():
 
 # ── Grouping and component validation ────────────────────────────────────────
 
-def test_transitive_group_is_merged_when_consistent():
+def _evidence(confidence, matched, overlap, minimum, reason="test"):
+    return dedupe.PairEvidence(
+        candidate_sources=frozenset({"photo"}),
+        matches=(),
+        full_matches=matched,
+        center_matches=0,
+        photo_match_frac=overlap,
+        matched_photos=matched,
+        min_hamming=minimum,
+        geo_distance_m=None,
+        price_rel_delta=None,
+        agreeing_fields=0,
+        conflicting_fields=(),
+        reason_code=reason,
+        confidence=confidence,
+    )
+
+
+def test_transitive_photo_bridge_keeps_strong_safe_cluster():
     hs = [_h(i) for i in range(8)]
     a = _listing("a", hs[:6])
     b = _listing("b", hs[2:8])
     c = _listing("c", hs[4:8] + [_h(20), _h(21)])
     res = dedupe.find_duplicate_groups([a, b, c])
-    assert res.groups == [[0, 1, 2]]
+    assert res.groups == [[0, 1], [2]]
+    assert any(review["reason_code"] == "incomplete_high_clique" for review in res.review_pairs)
 
 
-def test_inconsistent_component_is_split_not_merged():
+def test_area_conflict_bridge_does_not_discard_safe_cluster():
     """A~B and B~C, but A and C conflict on AREA — merging all three would destroy data."""
     hs = [_h(i) for i in range(8)]
     a = _listing("a", hs[:6], area_sqm=40.0)
@@ -375,7 +395,60 @@ def test_inconsistent_component_is_split_not_merged():
     c = _listing("c", hs[:6], area_sqm=80.0)
     res = dedupe.find_duplicate_groups([a, b, c])
     assert res.split_components == 1
-    assert sorted(res.groups) == [[0], [1], [2]]
+    assert sorted(res.groups) == [[0, 1], [2]]
+
+
+def test_complete_link_merges_a_direct_high_clique():
+    listings = [{"url": "a"}, {"url": "b"}, {"url": "c"}]
+    evidence = {
+        (0, 1): _evidence("HIGH", 6, 0.8, 0),
+        (0, 2): _evidence("HIGH", 5, 0.7, 1),
+        (1, 2): _evidence("HIGH", 4, 0.6, 2),
+    }
+
+    result = dedupe.complete_link_groups(listings, evidence)
+
+    assert result.groups == ((0, 1, 2),)
+    assert result.bridge_reviews == ()
+
+
+def test_complete_link_bridge_prefers_stronger_edge_and_emits_review():
+    listings = [{"url": "a"}, {"url": "b"}, {"url": "c"}]
+    evidence = {
+        (0, 1): _evidence("HIGH", 6, 0.8, 0),
+        (1, 2): _evidence("HIGH", 4, 0.7, 1),
+        (0, 2): _evidence("NONE", 0, 0.0, 20, "no_photo_matches"),
+    }
+
+    result = dedupe.complete_link_groups(listings, evidence)
+
+    assert result.groups == ((0, 1), (2,))
+    assert len(result.bridge_reviews) == 1
+    assert result.bridge_reviews[0]["reason_code"] == "incomplete_high_clique"
+    assert result.bridge_reviews[0]["component_ids"] == ["a", "b", "c"]
+
+
+def test_complete_link_is_deterministic_across_listing_and_edge_order():
+    stable_edges = {
+        ("a", "b"): _evidence("HIGH", 5, 0.8, 1),
+        ("a", "c"): _evidence("HIGH", 5, 0.8, 1),
+        ("b", "c"): _evidence("NONE", 0, 0.0, 30, "no_photo_matches"),
+    }
+    normalized = []
+    for order in itertools.permutations(("a", "b", "c")):
+        index = {name: position for position, name in enumerate(order)}
+        evidence = {
+            tuple(sorted((index[left], index[right]))): value
+            for (left, right), value in reversed(tuple(stable_edges.items()))
+        }
+        result = dedupe.complete_link_groups([{"url": name} for name in order], evidence)
+        normalized.append((
+            sorted(sorted(order[position] for position in group) for group in result.groups),
+            [(review["reason_code"], review["component_ids"]) for review in result.bridge_reviews],
+        ))
+
+    assert all(value == normalized[0] for value in normalized)
+    assert normalized[0][0] == [["a", "b"], ["c"]]
 
 
 def test_review_pairs_are_recorded_not_silently_dropped():
