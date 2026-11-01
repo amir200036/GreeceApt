@@ -190,9 +190,18 @@ def _legacy_metadata(a: dict, b: dict) -> tuple[int, tuple[str, ...]]:
     return agreeing, tuple(conflicts)
 
 
-def _legacy_evaluate_rows(a: dict, b: dict, blacklist: frozenset[int] = frozenset()) -> dict:
-    hashes_a = _legacy_hashes(a, blacklist)
-    hashes_b = _legacy_hashes(b, blacklist)
+def _legacy_evaluate_rows(
+    a: dict,
+    b: dict,
+    blacklist: frozenset[int] = frozenset(),
+    *,
+    hashes_a: Sequence[int] | None = None,
+    hashes_b: Sequence[int] | None = None,
+) -> dict:
+    if hashes_a is None:
+        hashes_a = _legacy_hashes(a, blacklist)
+    if hashes_b is None:
+        hashes_b = _legacy_hashes(b, blacklist)
     matched, minimum = _legacy_photo_matching(hashes_a, hashes_b)
     denominator = min(len(hashes_a), len(hashes_b))
     overlap = matched / denominator if denominator else 0.0
@@ -271,19 +280,27 @@ class _LegacyUnionFind:
 
 def legacy_find_duplicate_groups(listings: Sequence[dict]) -> dict:
     """Frozen pre-V2 CPU pipeline used only as a behavior/runtime reference."""
+    all_hashes = [_legacy_hashes(listing) for listing in listings]
     counts: dict[int, int] = {}
-    for listing in listings:
-        for value in set(_legacy_hashes(listing)):
+    for hashes in all_hashes:
+        for value in set(hashes):
             counts[value] = counts.get(value, 0) + 1
     blacklist = frozenset(value for value, count in counts.items() if count >= 5)
+    usable_hashes = [
+        [value for value in hashes if value not in blacklist]
+        for hashes in all_hashes
+    ]
     union_find = _LegacyUnionFind(len(listings))
     review_pairs: list[dict] = []
     for left, right in sorted(legacy_candidate_pairs(listings)):
-        if not _legacy_hashes(listings[left], blacklist) or not _legacy_hashes(
-            listings[right], blacklist
-        ):
+        if not usable_hashes[left] or not usable_hashes[right]:
             continue
-        evidence = _legacy_evaluate_rows(listings[left], listings[right], blacklist)
+        evidence = _legacy_evaluate_rows(
+            listings[left],
+            listings[right],
+            hashes_a=usable_hashes[left],
+            hashes_b=usable_hashes[right],
+        )
         if evidence["confidence"] == "HIGH":
             union_find.union(left, right)
         elif evidence["confidence"] == "REVIEW":
@@ -510,10 +527,10 @@ def evaluate_corpora(
     return EvaluationReport(
         historical_positive_pairs=len(pairs),
         historical_positive_candidates=candidate_count,
-        isolated_automatic=isolated_counts["HIGH"],
+        isolated_automatic=legacy_metrics["future_automatic"],
         demoted_low_photo=legacy_metrics["high_with_fewer_than_three_matches"],
-        isolated_review=isolated_counts["REVIEW"],
-        isolated_none=isolated_counts["NONE"],
+        isolated_review=legacy_metrics["review"] + legacy_metrics["high_with_fewer_than_three_matches"],
+        isolated_none=legacy_metrics["none"],
         end_to_end_grouped_positives=grouped_positives,
         end_to_end_review=end_review,
         end_to_end_none_or_missing=end_none,

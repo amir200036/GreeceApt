@@ -203,7 +203,7 @@ async def main() -> None:
             logger.info("%s scraper finished OK.", name)
 
     logger.info("Merging results → %s", OUTPUT_JSON)
-    listings, stale_listings, merged_pairs = await _merge(network_enabled=False)
+    listings, stale_listings, merged_pairs = await _merge(network_enabled=True)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with OUTPUT_JSON.open("w", encoding="utf-8") as f:
@@ -228,7 +228,7 @@ async def main() -> None:
 async def merge_only() -> None:
     """Re-run just the merge/dedupe over existing per-site JSON — no network scrape."""
     logger.info("=== run_all: merge-only (no scrape) ===")
-    listings, stale_listings, merged_pairs = await _merge()
+    listings, stale_listings, merged_pairs = await _merge(network_enabled=False)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with OUTPUT_JSON.open("w", encoding="utf-8") as f:
         json.dump(listings, f, indent=2, ensure_ascii=False)

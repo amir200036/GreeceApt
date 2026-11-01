@@ -109,7 +109,25 @@ def _parse_listing_photos(listing: dict) -> tuple[PhotoRef, ...]:
             fingerprint = PhotoFingerprint.from_json(value)
             if fingerprint is not None:
                 photos[f"legacy-{index:04d}"] = fingerprint
-    return tuple(PhotoRef(key, photos[key]) for key in sorted(photos))
+    unique: list[PhotoRef] = []
+    for key in sorted(photos):
+        candidate = PhotoRef(key, photos[key])
+        duplicate = False
+        for kept in unique:
+            distances = [
+                (left ^ right).bit_count()
+                for left, right in (
+                    (candidate.fingerprint.full, kept.fingerprint.full),
+                    (candidate.fingerprint.center, kept.fingerprint.center),
+                )
+                if left is not None and right is not None
+            ]
+            if distances and min(distances) <= 4:
+                duplicate = True
+                break
+        if not duplicate:
+            unique.append(candidate)
+    return tuple(unique)
 
 
 def _hash_refs(photos_by_listing: Sequence[Sequence[PhotoRef]]) -> tuple[HashRef, ...]:

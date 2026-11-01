@@ -285,6 +285,30 @@ def test_pair_evidence_records_sources_variants_counts_and_photo_keys():
     ]
 
 
+def test_duplicate_photo_content_under_distinct_keys_counts_once():
+    repeated = PhotoFingerprint("phash-v2", 123, 456).to_json()
+    a = _listing("a", [])
+    b = _listing("b", [])
+    a["photo_fingerprints"] = {f"a-{index}": repeated for index in range(3)}
+    b["photo_fingerprints"] = {f"b-{index}": repeated for index in range(3)}
+
+    result = dedupe.find_duplicate_groups([a, b])
+
+    assert result.groups == [[0], [1]]
+    assert result.high_confidence_pairs == 0
+    assert result.review_pairs[0]["matched_photos"] == 1
+
+
+def test_pair_review_json_is_independent_of_listing_order():
+    a = _listing("a", [_h(1), _h(2)])
+    b = _listing("b", [_h(1), _h(2)])
+
+    forward = dedupe.find_duplicate_groups([a, b]).review_pairs
+    reverse = dedupe.find_duplicate_groups([b, a]).review_pairs
+
+    assert forward == reverse
+
+
 # ── Blocking ─────────────────────────────────────────────────────────────────
 
 def test_distant_listings_still_paired_via_area_price_block():

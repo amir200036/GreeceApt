@@ -186,3 +186,22 @@ def test_survivor_merge_keeps_date_range_and_longer_photo_set():
     assert kept["publication_date"] == "2026-05-20"
     assert kept["photo_urls"] == ["1", "2", "3"]
     assert kept["photos_count"] == 3
+
+
+def test_normal_main_enables_network_and_merge_only_disables_it(monkeypatch, merge_paths):
+    calls = []
+
+    async def fake_subprocess(*args, **kwargs):
+        return None
+
+    async def fake_merge(*, network_enabled=True):
+        calls.append(network_enabled)
+        return [], [], []
+
+    monkeypatch.setattr(run_all, "_run_scraper_subprocess", fake_subprocess)
+    monkeypatch.setattr(run_all, "_merge", fake_merge)
+
+    asyncio.run(run_all.main())
+    asyncio.run(run_all.merge_only())
+
+    assert calls == [True, False]

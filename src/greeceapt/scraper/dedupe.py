@@ -207,7 +207,7 @@ def candidate_pairs(
             if area_delta <= AREA_REL_TOLERANCE and price_delta <= PRICE_REL_TOLERANCE:
                 add_pair(index, other_index, "metadata")
 
-    return {pair: frozenset(pair_sources) for pair, pair_sources in sorted(sources.items())}
+    return {pair: frozenset(pair_sources) for pair, pair_sources in sources.items()}
 
 
 # ── Pair scoring ──────────────────────────────────────────────────────────────
@@ -329,14 +329,17 @@ class PairEvidence:
 
 def pair_evidence_record(a: dict, b: dict, evidence: PairEvidence) -> dict:
     """Convert immutable pair evidence into the stable review/audit JSON contract."""
+    a_id = str(a.get("url") or a.get("id"))
+    b_id = str(b.get("url") or b.get("id"))
+    swap = a_id > b_id
     return {
-        "a_url": a.get("url") or a.get("id"),
-        "b_url": b.get("url") or b.get("id"),
+        "a_url": b_id if swap else a_id,
+        "b_url": a_id if swap else b_id,
         "candidate_sources": sorted(evidence.candidate_sources),
         "matches": [
             {
-                "a_photo_key": match.a_photo_key,
-                "b_photo_key": match.b_photo_key,
+                "a_photo_key": match.b_photo_key if swap else match.a_photo_key,
+                "b_photo_key": match.a_photo_key if swap else match.b_photo_key,
                 "distance": match.distance,
                 "variant": match.variant,
             }
@@ -589,7 +592,7 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
 
     high_edges = 0
     scoring_started = time.perf_counter()
-    for i, j in sorted(pairs):
+    for i, j in pairs:
         # The photo band index has exact recall for every Hamming distance < 5.
         # Geo/metadata-only pairs therefore have zero possible photo matches and cannot
         # reach REVIEW or HIGH; avoid an expensive Cartesian photo comparison for them.
@@ -608,5 +611,11 @@ def find_duplicate_groups(listings: Sequence[dict]) -> DedupeResult:
     grouping = complete_link_groups(listings, result.pair_evidence)
     result.groups = [list(group) for group in grouping.groups]
     result.review_pairs.extend(grouping.bridge_reviews)
+    result.review_pairs.sort(key=lambda review: (
+        review.get("reason_code", ""),
+        review.get("a_url", ""),
+        review.get("b_url", ""),
+        tuple(review.get("component_ids", ())),
+    ))
     result.split_components = len(grouping.bridge_reviews)
     return result

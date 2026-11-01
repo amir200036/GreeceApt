@@ -158,7 +158,7 @@ def test_final_evaluation_meets_corpus_and_hard_negative_gates():
     report = dedupe_eval.evaluate_corpora(
         HISTORICAL_FIXTURE,
         LIVE_FIXTURE,
-        benchmark_repeats=1,
+        benchmark_repeats=3,
     )
 
     assert report.historical_positive_pairs == 1_224
@@ -181,3 +181,31 @@ def test_evaluation_report_uses_historical_positive_coverage_language():
     assert "historical-positive coverage" in rendered
     assert "accuracy" not in rendered
     assert "precision" not in rendered
+
+
+def test_legacy_benchmark_parses_each_listing_hash_set_once():
+    dedupe_eval = importlib.import_module("greeceapt.scraper.dedupe_eval")
+
+    class CountingListing(dict):
+        hash_reads = 0
+
+        def get(self, key, default=None):
+            if key == "image_hashes":
+                type(self).hash_reads += 1
+            return super().get(key, default)
+
+    listings = [
+        CountingListing({
+            "id": f"listing-{index}",
+            "image_hashes": [f"{index + offset:016x}" for offset in range(3)],
+            "latitude": 37.9838,
+            "longitude": 23.7275,
+            "area_sqm": 50.0,
+            "price_eur": 100_000.0,
+        })
+        for index in range(12)
+    ]
+
+    dedupe_eval.legacy_find_duplicate_groups(listings)
+
+    assert CountingListing.hash_reads == len(listings)
