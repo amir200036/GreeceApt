@@ -21,12 +21,13 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timezone
 
 import httpx
-import imagehash
 
 from greeceapt.db_helpers import paths
+from greeceapt.scraper import dedupe
 from greeceapt.scraper import util as scraper_util
 
 # Aliased from ``paths`` so tests can ``monkeypatch.setattr(run_all, "DATA_DIR", tmp)``.
@@ -37,8 +38,10 @@ DELETED_JSON = paths.DELETED_LISTINGS_JSON
 STALE_JSON = paths.STALE_LISTINGS_JSON
 XE_JSON = paths.XE_LISTINGS_JSON
 SPITOGATOS_JSON = paths.SPITOGATOS_LISTINGS_JSON
+REVIEW_JSON = paths.DATA_DIR / "review_pairs.json"
 
 logger = logging.getLogger(__name__)
+DEDUPE_POLICY_VERSION = "phash-v2-conservative"
 
 
 async def _run_scraper_subprocess(module: str, label: str) -> None:
@@ -56,7 +59,7 @@ async def _run_scraper_subprocess(module: str, label: str) -> None:
     logger.info("%s subprocess finished OK (exit 0).", label)
 
 
-async def _merge() -> tuple[list[dict], list[dict], list[dict]]:
+async def _merge(*, network_enabled: bool = True) -> tuple[list[dict], list[dict], list[dict]]:
     all_raw: list[dict] = []
     for path, source in [(XE_JSON, "xe"), (SPITOGATOS_JSON, "spitogatos")]:
         if not path.exists():
@@ -75,100 +78,102 @@ async def _merge() -> tuple[list[dict], list[dict], list[dict]]:
         1 for r in all_raw for u in (r.get("photo_urls") or []) if u in url_cache
     )
     logger.info(
-        "Computing hashes for %s listings — %s/%s image URLs already cached",
+        "Computing fingerprints for %s listings — %s/%s image URLs already cached",
         len(all_raw), cached_hits, total_urls,
     )
 
     sem = asyncio.Semaphore(scraper_util.IMAGE_CONCURRENCY)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-        hash_results = await asyncio.gather(*(
-            scraper_util.compute_listing_photo_hashes(
-                r.get("photo_urls") or [], url_cache, sem, client,
-            )
-            for r in all_raw
-        ))
+    fingerprint_started = time.perf_counter()
+    if network_enabled:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            fingerprint_results = await asyncio.gather(*(
+                scraper_util.compute_listing_photo_fingerprints(
+                    r.get("photo_urls") or [], url_cache, sem, client,
+                )
+                for r in all_raw
+            ))
+    else:
+        fingerprint_results = [
+            {url: url_cache[url] for url in (row.get("photo_urls") or []) if url in url_cache}
+            for row in all_raw
+        ]
+    fingerprint_elapsed = time.perf_counter() - fingerprint_started
 
-    for listing, url_hash_map in zip(all_raw, hash_results):
-        listing["photo_url_hashes"] = url_hash_map
-        listing["image_hashes"] = sorted(set(url_hash_map.values()))
+    for listing, fingerprints_by_url in zip(all_raw, fingerprint_results):
+        listing["photo_fingerprints"] = {
+            url: fingerprint.to_json()
+            for url, fingerprint in fingerprints_by_url.items()
+        }
+        listing["photo_url_hashes"] = {
+            url: f"{fingerprint.full:016x}"
+            for url, fingerprint in fingerprints_by_url.items()
+            if fingerprint.full is not None
+        }
+        listing["image_hashes"] = sorted(set(listing["photo_url_hashes"].values()))
         listing.setdefault("source_urls", [listing.get("url", "")])
 
+    # Persist outside listings.json so wiping the merge output never forces a re-download.
+    scraper_util.save_standalone_phash_cache(url_cache)
     logger.info(
-        "Deduplicating %s listings — Quad-Lock (pHash D_H<%s + area/floor/year/energy)...",
-        len(all_raw), scraper_util.HASH_DH_THRESHOLD,
+        "Fingerprint cache persisted: %s URLs → %s (%.3fs, network_enabled=%s)",
+        len(url_cache), paths.PHASH_CACHE_JSON.name, fingerprint_elapsed, network_enabled,
     )
+
+    logger.info(
+        "Deduplicating %s listings — blocking (geo %.0fm grid ∪ area/price) + one-to-one "
+        "photo matching (D_H<%s) + null-aware metadata gate…",
+        len(all_raw), dedupe.GEO_CELL_M, dedupe.PHASH_HAMMING_THRESHOLD,
+    )
+    t0 = time.monotonic()
+    result = dedupe.find_duplicate_groups(all_raw)
+    elapsed = time.monotonic() - t0
+
     deduped: list[dict] = []
-    deduped_hash_objs: list[list[imagehash.ImageHash]] = []
     merged_pairs: list[dict] = []
-    quad_lock_rejections = 0
-
-    for listing in all_raw:
-        new_hash_strs: list[str] = listing.get("image_hashes") or []
-        new_hash_objs = [imagehash.hex_to_hash(h) for h in new_hash_strs]
-
-        matched_idx: int | None = None
-        if new_hash_objs:
-            for i, existing_objs in enumerate(deduped_hash_objs):
-                if not existing_objs:
-                    continue
-                is_phash_dup, phash_sim, min_h = scraper_util.phash_duplicate_metrics(
-                    new_hash_objs, existing_objs,
-                )
-                if not is_phash_dup:
-                    continue
-                if scraper_util.quad_lock_metadata_match(deduped[i], listing):
-                    matched_idx = i
-                    break
-                quad_lock_rejections += 1
-                logger.info(
-                    "Quad-Lock rejected duplicate candidate (pHash would merge): "
-                    "candidate=%s existing=%s — pHash similarity score = %.4f, min_hamming=%s, "
-                    "D_H threshold=%s; metadata mismatch (area=%s/%s floor=%s/%s year=%s/%s energy=%s/%s)",
-                    listing.get("url"),
-                    deduped[i].get("url"),
-                    phash_sim,
-                    min_h,
-                    scraper_util.HASH_DH_THRESHOLD,
-                    listing.get("area_sqm"),
-                    deduped[i].get("area_sqm"),
-                    listing.get("floor"),
-                    deduped[i].get("floor"),
-                    listing.get("year_built"),
-                    deduped[i].get("year_built"),
-                    listing.get("energy_class"),
-                    deduped[i].get("energy_class"),
-                )
-
-        if matched_idx is not None:
-            kept = deduped[matched_idx]
-            kept_objs = deduped_hash_objs[matched_idx]
-            _is_dup, phash_sim, min_h = scraper_util.phash_duplicate_metrics(
-                new_hash_objs, kept_objs,
-            )
-            kept_snapshot = dict(kept)
-            scraper_util.merge_duplicate_listing_into_kept(kept, listing)
-            deduped_hash_objs[matched_idx] = [
-                imagehash.hex_to_hash(h)
-                for h in (kept.get("image_hashes") or [])
-            ]
-            merged_pairs.append({"kept": kept_snapshot, "absorbed": dict(listing)})
+    for group in result.groups:
+        survivor = dict(all_raw[group[0]])
+        group_member_urls = [all_raw[index].get("url") or all_raw[index].get("id") for index in group]
+        authorizing_evidence = [
+            dedupe.pair_evidence_record(all_raw[left], all_raw[right], result.pair_evidence[(left, right)])
+            for position, left in enumerate(group)
+            for right in group[position + 1:]
+            if (left, right) in result.pair_evidence
+            and result.pair_evidence[(left, right)].confidence == "HIGH"
+        ]
+        for other_idx in group[1:]:
+            absorbed = all_raw[other_idx]
+            survivor_snapshot = dict(survivor)
+            scraper_util.merge_duplicate_listing_into_kept(survivor, absorbed)
+            merged_pairs.append({
+                "kept": survivor_snapshot,
+                "absorbed": dict(absorbed),
+                "dedupe_policy_version": DEDUPE_POLICY_VERSION,
+                "group_member_urls": group_member_urls,
+                "authorizing_evidence": authorizing_evidence,
+            })
             logger.info(
-                "Merged listing %s into %s: pHash similarity score = %.4f, min_hamming=%s "
-                "(threshold D_H<%s); Quad-Lock metadata aligned (area/floor/year/energy).",
-                listing.get("url"),
-                kept.get("url"),
-                phash_sim,
-                min_h,
-                scraper_util.HASH_DH_THRESHOLD,
+                "Merged %s into %s", absorbed.get("url"), survivor.get("url"),
             )
-        else:
-            deduped.append(dict(listing))
-            deduped_hash_objs.append(new_hash_objs)
+        deduped.append(survivor)
 
     logger.info(
-        "Deduplication: %s raw → %s unique listings (%s merged, %s visual-only false positives blocked)",
-        len(all_raw), len(deduped), len(merged_pairs), quad_lock_rejections,
+        "Deduplication: %s raw → %s unique (%s absorbed) in %.1fs — "
+        "%s candidate pairs scored, %s high-confidence, %s boilerplate photos in %s families ignored, "
+        "%s bridge components blocked, %s pairs flagged for review; pair scoring %.3fs; "
+        "candidates by source=%s",
+        len(all_raw), len(deduped), len(merged_pairs), elapsed,
+        result.candidate_pairs, result.high_confidence_pairs,
+        result.blacklisted_photos, result.blacklist_family_count,
+        result.split_components, len(result.review_pairs), result.pair_scoring_seconds,
+        result.candidate_pairs_by_source,
     )
+
+    if result.review_pairs:
+        with REVIEW_JSON.open("w", encoding="utf-8") as f:
+            json.dump(result.review_pairs, f, indent=2, ensure_ascii=False)
+        logger.info("Borderline pairs written to %s for inspection.", REVIEW_JSON)
+    else:
+        REVIEW_JSON.unlink(missing_ok=True)
 
     fresh = [r for r in deduped if not scraper_util.is_listing_stale_by_publication(r)]
     stale = [r for r in deduped if scraper_util.is_listing_stale_by_publication(r)]
@@ -198,7 +203,7 @@ async def main() -> None:
             logger.info("%s scraper finished OK.", name)
 
     logger.info("Merging results → %s", OUTPUT_JSON)
-    listings, stale_listings, merged_pairs = await _merge()
+    listings, stale_listings, merged_pairs = await _merge(network_enabled=True)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with OUTPUT_JSON.open("w", encoding="utf-8") as f:
@@ -220,8 +225,28 @@ async def main() -> None:
     )
 
 
+async def merge_only() -> None:
+    """Re-run just the merge/dedupe over existing per-site JSON — no network scrape."""
+    logger.info("=== run_all: merge-only (no scrape) ===")
+    listings, stale_listings, merged_pairs = await _merge(network_enabled=False)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with OUTPUT_JSON.open("w", encoding="utf-8") as f:
+        json.dump(listings, f, indent=2, ensure_ascii=False)
+    with DELETED_JSON.open("w", encoding="utf-8") as f:
+        json.dump(merged_pairs, f, indent=2, ensure_ascii=False)
+    with STALE_JSON.open("w", encoding="utf-8") as f:
+        json.dump(stale_listings, f, indent=2, ensure_ascii=False)
+    logger.info(
+        "merge-only done. %s fresh, %s stale, %s merged pairs.",
+        len(listings), len(stale_listings), len(merged_pairs),
+    )
+
+
 if __name__ == "__main__":
     from greeceapt.logging_config import configure_root_logging
 
     configure_root_logging()
-    asyncio.run(main())
+    if "--merge-only" in sys.argv:
+        asyncio.run(merge_only())
+    else:
+        asyncio.run(main())

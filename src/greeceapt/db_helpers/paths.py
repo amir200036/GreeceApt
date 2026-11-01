@@ -17,6 +17,9 @@ DELETED_LISTINGS_JSON = DATA_DIR / "deleted_listings.json"
 STALE_LISTINGS_JSON = DATA_DIR / "stale_listings.json"
 XE_LISTINGS_JSON = DATA_DIR / "xe_listings.json"
 SPITOGATOS_LISTINGS_JSON = DATA_DIR / "spitogatos_listings.json"
+# Standalone {photo_url: phash} cache. Survives listings.json being rebuilt or wiped,
+# so a fresh scrape does not re-download every image just to re-hash it.
+PHASH_CACHE_JSON = DATA_DIR / "phash_cache.json"
 COOKIES_JSON = DATA_DIR / "cookies.json"
 SPITOGATOS_COOKIES_JSON = DATA_DIR / "spito_cookies.json"
 OBSCURA_PATH = PROJECT_ROOT / "obscura"

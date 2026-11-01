@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 from PIL import Image
-import imagehash
 
 from greeceapt.ai_agent import ai_conductor
 from greeceapt.ai_agent import layer_2_aesthetic_filter as layer2
@@ -27,6 +26,7 @@ from greeceapt.db_helpers import insert_listings
 from greeceapt.pipeline import ingest
 from greeceapt.scraper import run_all
 from greeceapt.scraper import util as scraper_util
+from greeceapt.scraper.fingerprints import fingerprint_image
 from greeceapt.scoring import market_analytics
 from greeceapt.scoring import scoring_conductor
 
@@ -78,28 +78,29 @@ def pipeline_tmp(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(run_all, "STALE_JSON", tmp_path / "stale_listings.json")
     monkeypatch.setattr(run_all, "XE_JSON", tmp_path / "xe_listings.json")
     monkeypatch.setattr(run_all, "SPITOGATOS_JSON", tmp_path / "spitogatos_listings.json")
+    monkeypatch.setattr(scraper_util.paths, "PHASH_CACHE_JSON", tmp_path / "phash_cache.json")
 
     monkeypatch.setattr(ai_conductor, "DATA_DIR", tmp_path)
     yield tmp_path
 
 
-async def _fake_compute_listing_photo_hashes(
+async def _fake_compute_listing_photo_fingerprints(
     photo_urls: list[str],
-    url_cache: dict[str, str],
+    url_cache: dict,
     sem,
     client,
-) -> dict[str, str]:
-    """Deterministic pHashes without HTTP (merge dedupe stays per-listing)."""
-    out: dict[str, str] = {}
+) -> dict:
+    """Deterministic v2 fingerprints without HTTP (merge dedupe stays per-listing)."""
+    out = {}
     for u in photo_urls:
         if u in url_cache:
             out[u] = url_cache[u]
             continue
         rgb = (abs(hash(u)) % 220 + 20, (abs(hash(u)) >> 8) % 220, (abs(hash(u)) >> 16) % 220)
         im = Image.new("RGB", (32, 32), color=rgb)
-        h = str(imagehash.phash(im))
-        out[u] = h
-        url_cache[u] = h
+        value = fingerprint_image(im)
+        out[u] = value
+        url_cache[u] = value
     return out
 
 
@@ -114,7 +115,11 @@ def _stub_run_layer1(max_workers: int = 2) -> None:
 
 
 def test_merge_ingest_ai_scoring_full_pipeline(monkeypatch, pipeline_tmp: Path):
-    monkeypatch.setattr(scraper_util, "compute_listing_photo_hashes", _fake_compute_listing_photo_hashes)
+    monkeypatch.setattr(
+        scraper_util,
+        "compute_listing_photo_fingerprints",
+        _fake_compute_listing_photo_fingerprints,
+    )
     monkeypatch.setattr(ai_conductor, "run_layer1", _stub_run_layer1)
     monkeypatch.setattr(market_analytics, "compute_neighborhood_baselines", _stub_neighborhood_baselines)
     # Production MIN_NEIGHBORHOOD_SIZE=10 would purge tiny test hoods before scoring.
